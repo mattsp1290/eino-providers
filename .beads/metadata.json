@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "eino_providers",
+  "project_id": "aaed50c9-071d-4b4c-994f-135b5e21df6b"
+}
