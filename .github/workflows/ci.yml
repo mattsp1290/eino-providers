@@ -44,6 +44,9 @@ jobs:
       - name: Check non-Codex backend dependency graph
         run: scripts/check-dep-leaks.sh
 
+      - name: Check Gemini construction benchmark
+        run: bash scripts/check-gemini-benchmark.sh
+
       - name: Lint
         if: ${{ hashFiles('**/*.go') != '' }}
         uses: golangci/golangci-lint-action@v9
