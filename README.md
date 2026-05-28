@@ -52,11 +52,20 @@ The Ollama package exposes `ollama.NewChatModel` rather than a root
 before constructing the Eino Ollama chat model. Use `KeepAlive` for Ollama
 model residency, including `"-1"` for indefinite residency.
 
-OpenAI-Codex sets a non-secret placeholder API key only to satisfy the Eino
-OpenAI adapter constructor. The Codex HTTP transport owns endpoint rewriting,
-Bearer-token injection, and token refresh. Plan and quota API responses are
-classified as `ErrProviderAuth` and preserve the corresponding
-`codex-auth-go` sentinels for `errors.Is`.
+OpenAI-Codex's single-shot `Provider.Advise` path sets a non-secret placeholder
+API key only to satisfy the Eino OpenAI adapter constructor. The Codex HTTP
+transport owns endpoint rewriting, Bearer-token injection, and token refresh.
+Plan and quota API responses are classified as `ErrProviderAuth` and preserve
+the corresponding `codex-auth-go` sentinels for `errors.Is`.
+
+The `openaicodex` package also exposes `openaicodex.NewChatModel` /
+`NewChatModelWithHTTPClient` (returning `model.ToolCallingChatModel`): a native
+**Responses-API** streaming, tool-calling chat model for agent loops. It speaks
+the Codex Responses wire protocol directly (not Chat Completions), supports
+`Generate`, `Stream`, and `WithTools` (immutable, concurrency-safe), threads
+reasoning across turns for multi-turn tool calling, and preserves the same
+auth/plan/quota error sentinels. See `openaicodex/examples/toolcall` for a
+verified 2-turn tool-calling example.
 
 ## API Stability
 
@@ -67,6 +76,8 @@ The v0.1.x public API is intentionally small:
 - Backend constructors documented by their package comments and exported
   functions.
 - `ollama.NewChatModel` and `ollama.Config`.
+- `openaicodex.NewChatModel`, `openaicodex.NewChatModelWithHTTPClient`, and
+  `openaicodex.ChatModelConfig`.
 
 Use keyed struct literals for `Options` and backend config types:
 

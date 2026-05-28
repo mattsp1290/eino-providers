@@ -4,7 +4,17 @@ This changelog is maintained by hand until `v1.0.0`.
 
 ## Unreleased
 
-- No unreleased changes yet.
+- Added `openaicodex.NewChatModel` / `NewChatModelWithHTTPClient`: a native
+  Responses-API `model.ToolCallingChatModel` for the OpenAI-Codex subscription
+  backend, with `Generate`, `Stream`, and immutable `WithTools`. Speaks the
+  Codex Responses wire protocol directly (request body, SSE events, and tool
+  shape grounded in the `openai/codex` source), threads encrypted reasoning
+  across turns for multi-turn tool calling, aborts in-flight streams on context
+  cancellation, surfaces token usage on `ResponseMeta.Usage`, and preserves the
+  `ErrProviderAuth` / `codex-auth-go` auth/plan/quota sentinels. The existing
+  single-shot `Provider.Advise` path is unchanged.
+- Added `openaicodex/examples/toolcall`, a 2-turn tool-calling example over the
+  Codex subscription (public surface only; tested model `gpt-5.5`).
 
 ## v0.1.0
 
@@ -27,8 +37,10 @@ This changelog is maintained by hand until `v1.0.0`.
 Open deferrals:
 
 - No Bedrock, Together, or vLLM stub backends in v0.1.0.
-- Raw HTTP Codex chat model factory is deferred; v0.1.0 uses the Eino OpenAI
-  adapter plus Codex OAuth transport.
+- The single-shot `Provider.Advise` codex path still uses the Eino OpenAI
+  (Chat Completions) adapter behind the Codex transport; migrating it onto the
+  new native Responses-API ChatModel is a follow-up (the ChatModel surface now
+  exists and supersedes ADR-0007's deferral for streaming/tool-calling use).
 - `ChatModelFactory` remains a v0.2.0 design direction; v0.1.x keeps the
   single-shot `Provider.Advise` compatibility surface.
 - Advisor still needs call-site migration before deleting its lifted internal
