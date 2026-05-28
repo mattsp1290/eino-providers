@@ -15,6 +15,10 @@ The program runs a 2-turn exchange:
 
 - **Model:** `gpt-5.5` (the `codex` CLI default in `~/.codex/config.toml`;
   `model_reasoning_effort = "medium"`). Override with `CODEX_MODEL`.
+- **Verified on the live Codex endpoint (2026-05-28):** turn 1 streamed a real
+  `get_weather` tool call, turn 2 streamed the final answer token-by-token, and
+  usage was reported (prompt/completion/total) — confirming streaming, tool
+  calling, the multi-turn round-trip, and usage extraction end-to-end.
 - Reasoning is enabled by default and `reasoning.encrypted_content` items are
   round-tripped between turns (required for multi-turn tool calling on reasoning
   models). The example preserves the full assistant `schema.Message` (including
