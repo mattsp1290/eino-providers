@@ -206,10 +206,19 @@ func reasoningItemsFromExtra(msg *schema.Message) []json.RawMessage {
 // --- SSE event parsing ---
 
 type sseEvent struct {
-	Type     string          `json:"type"`
-	Delta    string          `json:"delta"`
-	Item     json.RawMessage `json:"item"`
-	Response json.RawMessage `json:"response"`
+	Type        string          `json:"type"`
+	Delta       string          `json:"delta"`
+	Item        json.RawMessage `json:"item"`
+	Response    json.RawMessage `json:"response"`
+	OutputIndex int             `json:"output_index"` // correlates output_item.added → delta → done
+}
+
+// fnCall tracks the in-flight state of a streaming function/tool call, keyed by output_index.
+type fnCall struct {
+	index    int    // stable ToolCall.Index assigned once at OPEN
+	name     string // captured at OPEN, repeated on each delta for self-describing chunks
+	callID   string // captured at OPEN (may be empty); backfilled authoritatively at CLOSE
+	sawDelta bool   // true once any function_call_arguments.delta arrived
 }
 
 type sseItem struct {
@@ -261,7 +270,8 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 
 	var (
 		dataBuf       strings.Builder
-		toolIndex     int
+		openCalls     = map[int]*fnCall{} // keyed by output_index
+		nextIndex     int
 		sawToolCall   bool
 		reasoningRaws []json.RawMessage
 		completed     bool
@@ -291,8 +301,12 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 			if ev.Delta != "" {
 				return send(&schema.Message{Role: schema.Assistant, ReasoningContent: ev.Delta})
 			}
+		case "response.output_item.added":
+			return handleOutputItemAdded(ev.Item, ev.OutputIndex, openCalls, &nextIndex, &sawToolCall, send)
+		case "response.function_call_arguments.delta":
+			return handleArgsDelta(ev.OutputIndex, ev.Delta, openCalls, send)
 		case "response.output_item.done":
-			return handleOutputItem(ev.Item, &toolIndex, &sawToolCall, &reasoningRaws, send)
+			return handleOutputItem(ev.Item, ev.OutputIndex, openCalls, &nextIndex, &sawToolCall, &reasoningRaws, send)
 		case "response.completed":
 			completed = true
 			msg := buildCompletedMessage(ev.Response, sawToolCall, reasoningRaws)
@@ -350,7 +364,9 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 
 func handleOutputItem(
 	raw json.RawMessage,
-	toolIndex *int,
+	outputIndex int,
+	openCalls map[int]*fnCall,
+	nextIndex *int,
 	sawToolCall *bool,
 	reasoningRaws *[]json.RawMessage,
 	send func(*schema.Message) bool,
@@ -364,23 +380,42 @@ func handleOutputItem(
 	}
 	switch item.Type {
 	case "function_call":
-		idx := *toolIndex
-		*toolIndex++
+		st, ok := openCalls[outputIndex]
+		if ok && st.sawDelta {
+			// Delta path: args were already emitted incrementally. Emit a final
+			// empty-args chunk to backfill ID/Name from the authoritative done item.
+			idx := st.index
+			return send(&schema.Message{
+				Role: schema.Assistant,
+				ToolCalls: []schema.ToolCall{{
+					Index:    &idx,
+					ID:       item.CallID, // done item carries call_id authoritatively
+					Type:     "function",
+					Function: schema.FunctionCall{Name: item.Name, Arguments: ""},
+				}},
+			})
+		}
+		// No deltas seen: emit the full args once.
+		var idx int
+		if ok {
+			idx = st.index // reuse the index from OPEN; do NOT reassign
+		} else {
+			// Defensive: done arrived with no prior added (e.g. TestChatModel_ReasoningRoundTrip).
+			idx = *nextIndex
+			*nextIndex++
+		}
 		*sawToolCall = true
 		args := item.Arguments
 		if args == "" {
-			args = "{}"
+			args = "{}" // fallback reserved for the completed-call emission only
 		}
 		return send(&schema.Message{
 			Role: schema.Assistant,
 			ToolCalls: []schema.ToolCall{{
-				Index: &idx,
-				ID:    item.CallID,
-				Type:  "function",
-				Function: schema.FunctionCall{
-					Name:      item.Name,
-					Arguments: args,
-				},
+				Index:    &idx,
+				ID:       item.CallID,
+				Type:     "function",
+				Function: schema.FunctionCall{Name: item.Name, Arguments: args},
 			}},
 		})
 	case "reasoning":
@@ -391,6 +426,62 @@ func handleOutputItem(
 		*reasoningRaws = append(*reasoningRaws, clone)
 	}
 	return false
+}
+
+func handleOutputItemAdded(
+	raw json.RawMessage,
+	outputIndex int,
+	openCalls map[int]*fnCall,
+	nextIndex *int,
+	sawToolCall *bool,
+	send func(*schema.Message) bool,
+) (stop bool) {
+	if len(raw) == 0 {
+		return false
+	}
+	var item sseItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false
+	}
+	if item.Type != "function_call" {
+		return false // strict no-op for message/reasoning/etc.
+	}
+	idx := *nextIndex
+	*nextIndex++
+	*sawToolCall = true
+	openCalls[outputIndex] = &fnCall{index: idx, name: item.Name, callID: item.CallID}
+	return send(&schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			Index:    &idx,
+			ID:       item.CallID, // may be empty on added; backfilled at CLOSE
+			Type:     "function",
+			Function: schema.FunctionCall{Name: item.Name, Arguments: ""},
+		}},
+	})
+}
+
+func handleArgsDelta(
+	outputIndex int,
+	delta string,
+	openCalls map[int]*fnCall,
+	send func(*schema.Message) bool,
+) (stop bool) {
+	st, ok := openCalls[outputIndex]
+	if !ok || delta == "" {
+		return false // unknown call or empty fragment: emit nothing
+	}
+	st.sawDelta = true
+	idx := st.index
+	return send(&schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			Index:    &idx,
+			ID:       st.callID, // repeat (safe atomic merge)
+			Type:     "function",
+			Function: schema.FunctionCall{Name: st.name, Arguments: delta},
+		}},
+	})
 }
 
 func buildCompletedMessage(raw json.RawMessage, sawToolCall bool, reasoningRaws []json.RawMessage) *schema.Message {
