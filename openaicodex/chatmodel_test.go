@@ -307,6 +307,186 @@ func TestChatModel_ReasoningRoundTrip(t *testing.T) {
 	}
 }
 
+func TestChatModel_Stream_ToolCall_IncrementalArgs(t *testing.T) {
+	t.Parallel()
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return sseOKResponse(
+			`{"type":"response.created","response":{}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"render_haiku","call_id":"call_xyz","arguments":""}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"title\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"Ocean at Dawn\","}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"mood\":\"calm\"}"}`,
+			`{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"title\":\"Ocean at Dawn\",\"mood\":\"calm\"}"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"render_haiku","call_id":"call_xyz","arguments":"{\"title\":\"Ocean at Dawn\",\"mood\":\"calm\"}"}}`,
+			`{"type":"response.completed","response":{"id":"resp_h","usage":{"input_tokens":30,"output_tokens":40,"total_tokens":70}}}`,
+		), nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("write a haiku")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	chunks := drain(t, sr)
+
+	// (1) Incrementality: arg-bearing chunks must track the 3 delta frames.
+	//     Every tool-call chunk must have a non-nil Index, and none may carry "{}".
+	argChunks := 0
+	for _, c := range chunks {
+		for _, tc := range c.ToolCalls {
+			if tc.Index == nil {
+				t.Errorf("tool-call chunk with nil Index: %+v", tc)
+			}
+			if tc.Function.Arguments == "{}" {
+				t.Errorf("a streamed chunk carried \"{}\" — forbidden")
+			}
+			if tc.Function.Arguments != "" {
+				argChunks++
+			}
+		}
+	}
+	if argChunks != 3 {
+		t.Errorf("arg-bearing chunks = %d, want 3 (one per delta)", argChunks)
+	}
+
+	// (2) Reassembly: exactly one merged call, exact concatenation, correct id/name.
+	merged, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		t.Fatalf("ConcatMessages: %v", err)
+	}
+	if len(merged.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1 (deltas merged, not split)", len(merged.ToolCalls))
+	}
+	tc := merged.ToolCalls[0]
+	const wantArgs = `{"title":"Ocean at Dawn","mood":"calm"}`
+	if tc.Function.Arguments != wantArgs {
+		t.Errorf("arguments = %q, want exactly %q", tc.Function.Arguments, wantArgs)
+	}
+	if tc.ID != "call_xyz" || tc.Function.Name != "render_haiku" {
+		t.Errorf("id/name = %q/%q, want call_xyz/render_haiku", tc.ID, tc.Function.Name)
+	}
+	if merged.ResponseMeta == nil || merged.ResponseMeta.FinishReason != "tool_calls" {
+		t.Errorf("finish reason = %+v, want tool_calls", merged.ResponseMeta)
+	}
+}
+
+// TestChatModel_Stream_ToolCall_IncrementalArgs_BlankCallID proves that the
+// delta-path CLOSE backfill correctly sets ID from the authoritative output_item.done,
+// even when the output_item.added frame carried no call_id.
+func TestChatModel_Stream_ToolCall_IncrementalArgs_BlankCallID(t *testing.T) {
+	t.Parallel()
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return sseOKResponse(
+			`{"type":"response.created","response":{}}`,
+			// added carries no call_id — blank field
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"render_haiku","arguments":""}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"title\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"Ocean at Dawn\","}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"mood\":\"calm\"}"}`,
+			`{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"title\":\"Ocean at Dawn\",\"mood\":\"calm\"}"}`,
+			// done carries the authoritative call_id
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"render_haiku","call_id":"call_xyz","arguments":"{\"title\":\"Ocean at Dawn\",\"mood\":\"calm\"}"}}`,
+			`{"type":"response.completed","response":{"id":"resp_h","usage":{"input_tokens":30,"output_tokens":40,"total_tokens":70}}}`,
+		), nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("write a haiku")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	chunks := drain(t, sr)
+
+	merged, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		t.Fatalf("ConcatMessages: %v", err)
+	}
+	if len(merged.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(merged.ToolCalls))
+	}
+	tc := merged.ToolCalls[0]
+	if tc.ID != "call_xyz" {
+		t.Errorf("merged ID = %q, want call_xyz — must come from the output_item.done CLOSE backfill, since added carried no call_id", tc.ID)
+	}
+	const wantArgs = `{"title":"Ocean at Dawn","mood":"calm"}`
+	if tc.Function.Arguments != wantArgs {
+		t.Errorf("arguments = %q, want exactly %q", tc.Function.Arguments, wantArgs)
+	}
+}
+
+// TestChatModel_Stream_ParallelToolCalls_Interleaved exercises the output_index-keyed
+// openCalls map: two function calls stream concurrently with interleaved delta frames.
+func TestChatModel_Stream_ParallelToolCalls_Interleaved(t *testing.T) {
+	t.Parallel()
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return sseOKResponse(
+			`{"type":"response.created","response":{}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"f0","call_id":"c0","arguments":""}}`,
+			`{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","name":"f1","call_id":"c1","arguments":""}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"b\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"1}"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"2}"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"f0","call_id":"c0","arguments":"{\"a\":1}"}}`,
+			`{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","name":"f1","call_id":"c1","arguments":"{\"b\":2}"}}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}`,
+		), nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("go")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	merged, err := schema.ConcatMessages(drain(t, sr))
+	if err != nil {
+		t.Fatalf("ConcatMessages: %v", err)
+	}
+	if len(merged.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %d, want 2 (one per output_index)", len(merged.ToolCalls))
+	}
+	// concatToolCalls sorts by Index, so call[0] = output_index 0 (nextIndex=0) and call[1] = output_index 1 (nextIndex=1).
+	if got := merged.ToolCalls[0]; got.ID != "c0" || got.Function.Name != "f0" || got.Function.Arguments != `{"a":1}` {
+		t.Errorf("call[0] = {ID:%q Name:%q Args:%q}, want c0/f0/{\"a\":1}", got.ID, got.Function.Name, got.Function.Arguments)
+	}
+	if got := merged.ToolCalls[1]; got.ID != "c1" || got.Function.Name != "f1" || got.Function.Arguments != `{"b":2}` {
+		t.Errorf("call[1] = {ID:%q Name:%q Args:%q}, want c1/f1/{\"b\":2}", got.ID, got.Function.Name, got.Function.Arguments)
+	}
+	if merged.ResponseMeta == nil || merged.ResponseMeta.FinishReason != "tool_calls" {
+		t.Errorf("finish reason = %+v, want tool_calls", merged.ResponseMeta)
+	}
+}
+
+// TestChatModel_Stream_ToolCall_EmptyArgs exercises the "{}" fallback: a function call
+// whose output_item.done carries empty arguments (no deltas) must merge to "{}".
+func TestChatModel_Stream_ToolCall_EmptyArgs(t *testing.T) {
+	t.Parallel()
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return sseOKResponse(
+			`{"type":"response.created","response":{}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"no_args","call_id":"call_noargs","arguments":""}}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"no_args","call_id":"call_noargs","arguments":""}}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{}}}`,
+		), nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("go")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	merged, err := schema.ConcatMessages(drain(t, sr))
+	if err != nil {
+		t.Fatalf("ConcatMessages: %v", err)
+	}
+	if len(merged.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(merged.ToolCalls))
+	}
+	if got := merged.ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Errorf("arguments = %q, want \"{}\" (empty-args fallback)", got)
+	}
+}
+
 func TestChatModel_CtxCancel(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

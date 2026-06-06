@@ -25,6 +25,27 @@ const extraKeyReasoningItems = "openaicodex:reasoning_items"
 // be large, so this is well above bufio's 64KiB default.
 const sseMaxLineBytes = 10 << 20 // 10 MiB
 
+// Responses-API SSE event types handled by the dispatch switch.
+// Unrecognized types fall through to the default (return false / ignore).
+const (
+	evOutputTextDelta         = "response.output_text.delta"
+	evReasoningTextDelta      = "response.reasoning_text.delta"
+	evReasoningSummaryDelta   = "response.reasoning_summary_text.delta"
+	evOutputItemAdded         = "response.output_item.added"
+	evFnCallArgsDelta         = "response.function_call_arguments.delta"
+	evFnCallArgsDone          = "response.function_call_arguments.done"
+	evOutputItemDone          = "response.output_item.done"
+	evCompleted               = "response.completed"
+	evFailed                  = "response.failed"
+	evIncomplete              = "response.incomplete"
+)
+
+// Responses-API output item types.
+const (
+	itemTypeFunctionCall = "function_call"
+	itemTypeReasoning    = "reasoning"
+)
+
 // --- Responses API request types ---
 //
 // Field presence mirrors the codex CLI's ResponsesApiRequest
@@ -206,10 +227,22 @@ func reasoningItemsFromExtra(msg *schema.Message) []json.RawMessage {
 // --- SSE event parsing ---
 
 type sseEvent struct {
-	Type     string          `json:"type"`
-	Delta    string          `json:"delta"`
-	Item     json.RawMessage `json:"item"`
-	Response json.RawMessage `json:"response"`
+	Type        string          `json:"type"`
+	Delta       string          `json:"delta"`
+	Item        json.RawMessage `json:"item"`
+	Response    json.RawMessage `json:"response"`
+	// OutputIndex correlates output_item.added → function_call_arguments.delta → output_item.done
+	// for the same function call. Absent field decodes to 0; the real API always sends this
+	// field for parallel tool calls, so parallel-call correctness depends on that guarantee.
+	OutputIndex int `json:"output_index"`
+}
+
+// fnCall tracks the in-flight state of a streaming function/tool call, keyed by output_index.
+type fnCall struct {
+	index    int    // stable ToolCall.Index assigned once at OPEN
+	name     string // captured at OPEN, repeated on each delta for self-describing chunks
+	callID   string // captured at OPEN (may be empty); backfilled authoritatively at CLOSE
+	sawDelta bool   // true once any function_call_arguments.delta arrived
 }
 
 type sseItem struct {
@@ -261,7 +294,8 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 
 	var (
 		dataBuf       strings.Builder
-		toolIndex     int
+		openCalls     = map[int]*fnCall{} // keyed by output_index
+		nextIndex     int
 		sawToolCall   bool
 		reasoningRaws []json.RawMessage
 		completed     bool
@@ -283,21 +317,29 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 			return false
 		}
 		switch ev.Type {
-		case "response.output_text.delta":
+		case evOutputTextDelta:
 			if ev.Delta != "" {
 				return send(&schema.Message{Role: schema.Assistant, Content: ev.Delta})
 			}
-		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		case evReasoningTextDelta, evReasoningSummaryDelta:
 			if ev.Delta != "" {
 				return send(&schema.Message{Role: schema.Assistant, ReasoningContent: ev.Delta})
 			}
-		case "response.output_item.done":
-			return handleOutputItem(ev.Item, &toolIndex, &sawToolCall, &reasoningRaws, send)
-		case "response.completed":
+		case evOutputItemAdded:
+			return handleOutputItemAdded(ev.Item, ev.OutputIndex, openCalls, &nextIndex, &sawToolCall, send)
+		case evFnCallArgsDelta:
+			return handleArgsDelta(ev.OutputIndex, ev.Delta, openCalls, send)
+		case evFnCallArgsDone:
+			// Intentionally ignored: output_item.done is the authoritative source for
+			// final args/id; handling this frame would double-count the arguments.
+			return false
+		case evOutputItemDone:
+			return handleOutputItem(ev.Item, ev.OutputIndex, openCalls, &nextIndex, &sawToolCall, &reasoningRaws, send)
+		case evCompleted:
 			completed = true
 			msg := buildCompletedMessage(ev.Response, sawToolCall, reasoningRaws)
 			return send(msg)
-		case "response.failed", "response.incomplete":
+		case evFailed, evIncomplete:
 			sw.Send(nil, classifyStreamError(ev.Response, ev.Type))
 			return true
 		}
@@ -350,7 +392,9 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 
 func handleOutputItem(
 	raw json.RawMessage,
-	toolIndex *int,
+	outputIndex int,
+	openCalls map[int]*fnCall,
+	nextIndex *int,
 	sawToolCall *bool,
 	reasoningRaws *[]json.RawMessage,
 	send func(*schema.Message) bool,
@@ -363,27 +407,48 @@ func handleOutputItem(
 		return false
 	}
 	switch item.Type {
-	case "function_call":
-		idx := *toolIndex
-		*toolIndex++
+	case itemTypeFunctionCall:
+		st, ok := openCalls[outputIndex]
+		if ok && st.sawDelta {
+			// Delta path: args were already emitted incrementally. Emit a final
+			// empty-args chunk to backfill ID/Name from the authoritative done item.
+			idx := st.index
+			// item.CallID from done is assumed equal to item.CallID from added when both
+			// are non-empty; a mismatch would cause concatToolCalls to error the stream.
+			return send(&schema.Message{
+				Role: schema.Assistant,
+				ToolCalls: []schema.ToolCall{{
+					Index:    &idx,
+					ID:       item.CallID, // done item carries call_id authoritatively
+					Type:     "function",
+					Function: schema.FunctionCall{Name: item.Name, Arguments: ""},
+				}},
+			})
+		}
+		// No deltas seen: emit the full args once.
+		var idx int
+		if ok {
+			idx = st.index // reuse the index from OPEN; do NOT reassign
+		} else {
+			// Defensive: done arrived with no prior added (e.g. TestChatModel_ReasoningRoundTrip).
+			idx = *nextIndex
+			*nextIndex++
+		}
 		*sawToolCall = true
 		args := item.Arguments
 		if args == "" {
-			args = "{}"
+			args = "{}" // fallback reserved for the completed-call emission only
 		}
 		return send(&schema.Message{
 			Role: schema.Assistant,
 			ToolCalls: []schema.ToolCall{{
-				Index: &idx,
-				ID:    item.CallID,
-				Type:  "function",
-				Function: schema.FunctionCall{
-					Name:      item.Name,
-					Arguments: args,
-				},
+				Index:    &idx,
+				ID:       item.CallID,
+				Type:     "function",
+				Function: schema.FunctionCall{Name: item.Name, Arguments: args},
 			}},
 		})
-	case "reasoning":
+	case itemTypeReasoning:
 		// Preserve the raw item verbatim (id + encrypted_content + summary) so it
 		// can be re-threaded into a later turn's input.
 		clone := make(json.RawMessage, len(raw))
@@ -391,6 +456,62 @@ func handleOutputItem(
 		*reasoningRaws = append(*reasoningRaws, clone)
 	}
 	return false
+}
+
+func handleOutputItemAdded(
+	raw json.RawMessage,
+	outputIndex int,
+	openCalls map[int]*fnCall,
+	nextIndex *int,
+	sawToolCall *bool,
+	send func(*schema.Message) bool,
+) (stop bool) {
+	if len(raw) == 0 {
+		return false
+	}
+	var item sseItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false
+	}
+	if item.Type != itemTypeFunctionCall {
+		return false // strict no-op for message/reasoning/etc.
+	}
+	idx := *nextIndex
+	*nextIndex++
+	*sawToolCall = true
+	openCalls[outputIndex] = &fnCall{index: idx, name: item.Name, callID: item.CallID}
+	return send(&schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			Index:    &idx,
+			ID:       item.CallID, // may be empty on added; backfilled at CLOSE
+			Type:     "function",
+			Function: schema.FunctionCall{Name: item.Name, Arguments: ""},
+		}},
+	})
+}
+
+func handleArgsDelta(
+	outputIndex int,
+	delta string,
+	openCalls map[int]*fnCall,
+	send func(*schema.Message) bool,
+) (stop bool) {
+	st, ok := openCalls[outputIndex]
+	if !ok || delta == "" {
+		return false // unknown call or empty fragment: emit nothing
+	}
+	st.sawDelta = true
+	idx := st.index
+	return send(&schema.Message{
+		Role: schema.Assistant,
+		ToolCalls: []schema.ToolCall{{
+			Index:    &idx,
+			ID:       st.callID, // repeat (safe atomic merge)
+			Type:     "function",
+			Function: schema.FunctionCall{Name: st.name, Arguments: delta},
+		}},
+	})
 }
 
 func buildCompletedMessage(raw json.RawMessage, sawToolCall bool, reasoningRaws []json.RawMessage) *schema.Message {
