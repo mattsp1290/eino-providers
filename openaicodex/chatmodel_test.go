@@ -414,6 +414,79 @@ func TestChatModel_Stream_ToolCall_IncrementalArgs_BlankCallID(t *testing.T) {
 	}
 }
 
+// TestChatModel_Stream_ParallelToolCalls_Interleaved exercises the output_index-keyed
+// openCalls map: two function calls stream concurrently with interleaved delta frames.
+func TestChatModel_Stream_ParallelToolCalls_Interleaved(t *testing.T) {
+	t.Parallel()
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return sseOKResponse(
+			`{"type":"response.created","response":{}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"f0","call_id":"c0","arguments":""}}`,
+			`{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","name":"f1","call_id":"c1","arguments":""}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"b\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":0,"delta":"1}"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"2}"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"f0","call_id":"c0","arguments":"{\"a\":1}"}}`,
+			`{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","name":"f1","call_id":"c1","arguments":"{\"b\":2}"}}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{"input_tokens":10,"output_tokens":10,"total_tokens":20}}}`,
+		), nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("go")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	merged, err := schema.ConcatMessages(drain(t, sr))
+	if err != nil {
+		t.Fatalf("ConcatMessages: %v", err)
+	}
+	if len(merged.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %d, want 2 (one per output_index)", len(merged.ToolCalls))
+	}
+	// concatToolCalls sorts by Index, so call[0] = output_index 0 (nextIndex=0) and call[1] = output_index 1 (nextIndex=1).
+	if got := merged.ToolCalls[0]; got.ID != "c0" || got.Function.Name != "f0" || got.Function.Arguments != `{"a":1}` {
+		t.Errorf("call[0] = {ID:%q Name:%q Args:%q}, want c0/f0/{\"a\":1}", got.ID, got.Function.Name, got.Function.Arguments)
+	}
+	if got := merged.ToolCalls[1]; got.ID != "c1" || got.Function.Name != "f1" || got.Function.Arguments != `{"b":2}` {
+		t.Errorf("call[1] = {ID:%q Name:%q Args:%q}, want c1/f1/{\"b\":2}", got.ID, got.Function.Name, got.Function.Arguments)
+	}
+	if merged.ResponseMeta == nil || merged.ResponseMeta.FinishReason != "tool_calls" {
+		t.Errorf("finish reason = %+v, want tool_calls", merged.ResponseMeta)
+	}
+}
+
+// TestChatModel_Stream_ToolCall_EmptyArgs exercises the "{}" fallback: a function call
+// whose output_item.done carries empty arguments (no deltas) must merge to "{}".
+func TestChatModel_Stream_ToolCall_EmptyArgs(t *testing.T) {
+	t.Parallel()
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return sseOKResponse(
+			`{"type":"response.created","response":{}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"no_args","call_id":"call_noargs","arguments":""}}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"no_args","call_id":"call_noargs","arguments":""}}`,
+			`{"type":"response.completed","response":{"id":"r","usage":{}}}`,
+		), nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("go")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	merged, err := schema.ConcatMessages(drain(t, sr))
+	if err != nil {
+		t.Fatalf("ConcatMessages: %v", err)
+	}
+	if len(merged.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(merged.ToolCalls))
+	}
+	if got := merged.ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Errorf("arguments = %q, want \"{}\" (empty-args fallback)", got)
+	}
+}
+
 func TestChatModel_CtxCancel(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -25,6 +25,27 @@ const extraKeyReasoningItems = "openaicodex:reasoning_items"
 // be large, so this is well above bufio's 64KiB default.
 const sseMaxLineBytes = 10 << 20 // 10 MiB
 
+// Responses-API SSE event types handled by the dispatch switch.
+// Unrecognized types fall through to the default (return false / ignore).
+const (
+	evOutputTextDelta         = "response.output_text.delta"
+	evReasoningTextDelta      = "response.reasoning_text.delta"
+	evReasoningSummaryDelta   = "response.reasoning_summary_text.delta"
+	evOutputItemAdded         = "response.output_item.added"
+	evFnCallArgsDelta         = "response.function_call_arguments.delta"
+	evFnCallArgsDone          = "response.function_call_arguments.done"
+	evOutputItemDone          = "response.output_item.done"
+	evCompleted               = "response.completed"
+	evFailed                  = "response.failed"
+	evIncomplete              = "response.incomplete"
+)
+
+// Responses-API output item types.
+const (
+	itemTypeFunctionCall = "function_call"
+	itemTypeReasoning    = "reasoning"
+)
+
 // --- Responses API request types ---
 //
 // Field presence mirrors the codex CLI's ResponsesApiRequest
@@ -210,7 +231,10 @@ type sseEvent struct {
 	Delta       string          `json:"delta"`
 	Item        json.RawMessage `json:"item"`
 	Response    json.RawMessage `json:"response"`
-	OutputIndex int             `json:"output_index"` // correlates output_item.added → delta → done
+	// OutputIndex correlates output_item.added → function_call_arguments.delta → output_item.done
+	// for the same function call. Absent field decodes to 0; the real API always sends this
+	// field for parallel tool calls, so parallel-call correctness depends on that guarantee.
+	OutputIndex int `json:"output_index"`
 }
 
 // fnCall tracks the in-flight state of a streaming function/tool call, keyed by output_index.
@@ -293,25 +317,29 @@ func streamResponses(ctx context.Context, body io.Reader, sw *schema.StreamWrite
 			return false
 		}
 		switch ev.Type {
-		case "response.output_text.delta":
+		case evOutputTextDelta:
 			if ev.Delta != "" {
 				return send(&schema.Message{Role: schema.Assistant, Content: ev.Delta})
 			}
-		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
+		case evReasoningTextDelta, evReasoningSummaryDelta:
 			if ev.Delta != "" {
 				return send(&schema.Message{Role: schema.Assistant, ReasoningContent: ev.Delta})
 			}
-		case "response.output_item.added":
+		case evOutputItemAdded:
 			return handleOutputItemAdded(ev.Item, ev.OutputIndex, openCalls, &nextIndex, &sawToolCall, send)
-		case "response.function_call_arguments.delta":
+		case evFnCallArgsDelta:
 			return handleArgsDelta(ev.OutputIndex, ev.Delta, openCalls, send)
-		case "response.output_item.done":
+		case evFnCallArgsDone:
+			// Intentionally ignored: output_item.done is the authoritative source for
+			// final args/id; handling this frame would double-count the arguments.
+			return false
+		case evOutputItemDone:
 			return handleOutputItem(ev.Item, ev.OutputIndex, openCalls, &nextIndex, &sawToolCall, &reasoningRaws, send)
-		case "response.completed":
+		case evCompleted:
 			completed = true
 			msg := buildCompletedMessage(ev.Response, sawToolCall, reasoningRaws)
 			return send(msg)
-		case "response.failed", "response.incomplete":
+		case evFailed, evIncomplete:
 			sw.Send(nil, classifyStreamError(ev.Response, ev.Type))
 			return true
 		}
@@ -379,12 +407,14 @@ func handleOutputItem(
 		return false
 	}
 	switch item.Type {
-	case "function_call":
+	case itemTypeFunctionCall:
 		st, ok := openCalls[outputIndex]
 		if ok && st.sawDelta {
 			// Delta path: args were already emitted incrementally. Emit a final
 			// empty-args chunk to backfill ID/Name from the authoritative done item.
 			idx := st.index
+			// item.CallID from done is assumed equal to item.CallID from added when both
+			// are non-empty; a mismatch would cause concatToolCalls to error the stream.
 			return send(&schema.Message{
 				Role: schema.Assistant,
 				ToolCalls: []schema.ToolCall{{
@@ -418,7 +448,7 @@ func handleOutputItem(
 				Function: schema.FunctionCall{Name: item.Name, Arguments: args},
 			}},
 		})
-	case "reasoning":
+	case itemTypeReasoning:
 		// Preserve the raw item verbatim (id + encrypted_content + summary) so it
 		// can be re-threaded into a later turn's input.
 		clone := make(json.RawMessage, len(raw))
@@ -443,7 +473,7 @@ func handleOutputItemAdded(
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return false
 	}
-	if item.Type != "function_call" {
+	if item.Type != itemTypeFunctionCall {
 		return false // strict no-op for message/reasoning/etc.
 	}
 	idx := *nextIndex
