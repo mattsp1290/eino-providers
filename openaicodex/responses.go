@@ -28,16 +28,16 @@ const sseMaxLineBytes = 10 << 20 // 10 MiB
 // Responses-API SSE event types handled by the dispatch switch.
 // Unrecognized types fall through to the default (return false / ignore).
 const (
-	evOutputTextDelta         = "response.output_text.delta"
-	evReasoningTextDelta      = "response.reasoning_text.delta"
-	evReasoningSummaryDelta   = "response.reasoning_summary_text.delta"
-	evOutputItemAdded         = "response.output_item.added"
-	evFnCallArgsDelta         = "response.function_call_arguments.delta"
-	evFnCallArgsDone          = "response.function_call_arguments.done"
-	evOutputItemDone          = "response.output_item.done"
-	evCompleted               = "response.completed"
-	evFailed                  = "response.failed"
-	evIncomplete              = "response.incomplete"
+	evOutputTextDelta       = "response.output_text.delta"
+	evReasoningTextDelta    = "response.reasoning_text.delta"
+	evReasoningSummaryDelta = "response.reasoning_summary_text.delta"
+	evOutputItemAdded       = "response.output_item.added"
+	evFnCallArgsDelta       = "response.function_call_arguments.delta"
+	evFnCallArgsDone        = "response.function_call_arguments.done"
+	evOutputItemDone        = "response.output_item.done"
+	evCompleted             = "response.completed"
+	evFailed                = "response.failed"
+	evIncomplete            = "response.incomplete"
 )
 
 // Responses-API output item types.
@@ -227,10 +227,10 @@ func reasoningItemsFromExtra(msg *schema.Message) []json.RawMessage {
 // --- SSE event parsing ---
 
 type sseEvent struct {
-	Type        string          `json:"type"`
-	Delta       string          `json:"delta"`
-	Item        json.RawMessage `json:"item"`
-	Response    json.RawMessage `json:"response"`
+	Type     string          `json:"type"`
+	Delta    string          `json:"delta"`
+	Item     json.RawMessage `json:"item"`
+	Response json.RawMessage `json:"response"`
 	// OutputIndex correlates output_item.added → function_call_arguments.delta → output_item.done
 	// for the same function call. Absent field decodes to 0; the real API always sends this
 	// field for parallel tool calls, so parallel-call correctness depends on that guarantee.
