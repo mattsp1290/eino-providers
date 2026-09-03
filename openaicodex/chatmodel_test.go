@@ -99,6 +99,86 @@ func TestChatModel_Stream_Text(t *testing.T) {
 	}
 }
 
+type panickingResponseBody struct {
+	reader     io.Reader
+	readPanic  any
+	closePanic any
+	closed     bool
+}
+
+func (b *panickingResponseBody) Read(p []byte) (int, error) {
+	if b.readPanic != nil {
+		panic(b.readPanic)
+	}
+	return b.reader.Read(p)
+}
+
+func (b *panickingResponseBody) Close() error {
+	b.closed = true
+	if b.closePanic != nil {
+		panic(b.closePanic)
+	}
+	return nil
+}
+
+func TestChatModel_Stream_ContainsReadPanic(t *testing.T) {
+	t.Parallel()
+	const secret = "provider-secret-read-value"
+	body := &panickingResponseBody{reader: strings.NewReader(""), readPanic: secret}
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("hi")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer sr.Close()
+	_, err = sr.Recv()
+	if !errors.Is(err, errResponseStreamFailed) {
+		t.Fatalf("Recv error = %v, want %v", err, errResponseStreamFailed)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("Recv error leaked panic value: %v", err)
+	}
+	if !body.closed {
+		t.Fatal("response body was not closed after read panic")
+	}
+}
+
+func TestChatModel_Stream_ContainsClosePanic(t *testing.T) {
+	t.Parallel()
+	const secret = "provider-secret-close-value"
+	body := &panickingResponseBody{
+		reader:     strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n"),
+		closePanic: secret,
+	}
+	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header)}, nil
+	})
+	cm := newTestChatModel(t, stub)
+
+	sr, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("hi")})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer sr.Close()
+	if _, recvErr := sr.Recv(); recvErr != nil {
+		t.Fatalf("completed chunk: %v", recvErr)
+	}
+	_, err = sr.Recv()
+	if !errors.Is(err, errResponseStreamFailed) {
+		t.Fatalf("Recv error = %v, want %v", err, errResponseStreamFailed)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("Recv error leaked panic value: %v", err)
+	}
+	if !body.closed {
+		t.Fatal("response body Close was not called")
+	}
+}
+
 func TestChatModel_Stream_ToolCall(t *testing.T) {
 	t.Parallel()
 	stub := stubRoundTripper(func(*http.Request) (*http.Response, error) {

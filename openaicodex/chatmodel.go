@@ -18,6 +18,8 @@ import (
 
 const defaultReasoningEffort = "medium"
 
+var errResponseStreamFailed = errors.New("openai-codex: response stream failed")
+
 // newCodexChatClient is the seam for building a Codex-authenticated client for
 // the ChatModel surface. It honours the caller-supplied AppName (unlike the
 // legacy codexHTTPClient seam, which is pinned to "advisor").
@@ -195,8 +197,13 @@ func (m *chatModel) Stream(ctx context.Context, input []*schema.Message, opts ..
 	sr, sw := schema.Pipe[*schema.Message](16)
 	go func() {
 		defer cancel()
-		defer func() { _ = resp.Body.Close() }()
 		defer sw.Close()
+		defer func() {
+			if recover() != nil {
+				sw.Send(nil, errResponseStreamFailed)
+			}
+		}()
+		defer func() { _ = resp.Body.Close() }()
 		streamResponses(reqCtx, resp.Body, sw)
 	}()
 	return sr, nil
