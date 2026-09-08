@@ -37,8 +37,9 @@ type Options struct {
 	BaseURL *string
 
 	// MaxTokens requests an output-token cap where the backend supports one.
-	// OpenCode-Go Messages models require a positive cap; its other protocols
-	// allow this field to be nil.
+	// OpenCode-Go's direct Messages chat-model constructor requires a positive
+	// cap. Its registered Provider may leave this nil because Advise supplies
+	// the positive cap per invocation. Chat Completions and Responses allow nil.
 	// OpenAI-Codex ignores this because the Codex endpoint manages output
 	// length server-side.
 	MaxTokens *int

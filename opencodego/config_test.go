@@ -37,10 +37,9 @@ func TestValidateConfig(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                     string
-		cfg                      ChatModelConfig
-		requireMessagesMaxTokens bool
-		wantErr                  string
+		name    string
+		cfg     ChatModelConfig
+		wantErr string
 	}{
 		{name: "valid without cap", cfg: base},
 		{name: "valid with cap", cfg: func() ChatModelConfig {
@@ -63,27 +62,17 @@ func TestValidateConfig(t *testing.T) {
 			cfg.Protocol = "unknown"
 			return cfg
 		}(), wantErr: `unknown Protocol "unknown"`},
-		{name: "user agent is required", cfg: func() ChatModelConfig {
-			cfg := base
-			cfg.UserAgent = "  "
-			return cfg
-		}(), wantErr: "UserAgent is required"},
 		{name: "cap must be positive", cfg: func() ChatModelConfig {
 			cfg := base
 			zero := 0
 			cfg.MaxTokens = &zero
 			return cfg
 		}(), wantErr: "MaxTokens must be > 0"},
-		{name: "messages direct model requires cap", cfg: func() ChatModelConfig {
-			cfg := base
-			cfg.Protocol = ProtocolMessages
-			return cfg
-		}(), requireMessagesMaxTokens: true, wantErr: "MaxTokens is required for Messages"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateConfig(tt.cfg, tt.requireMessagesMaxTokens)
+			err := validateConfig(tt.cfg, providerConstruction)
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("validateConfig() error = %v", err)
@@ -103,35 +92,40 @@ func TestValidateConfigMessagesCapDistinction(t *testing.T) {
 		Protocol:  ProtocolMessages,
 		UserAgent: "host-agent/1.0",
 	}
-	if err := validateConfig(cfg, false); err != nil {
+	if err := validateConfig(cfg, providerConstruction); err != nil {
 		t.Fatalf("Advise-style validation error = %v", err)
 	}
-	if err := validateConfig(cfg, true); err == nil {
+	if err := validateConfig(cfg, chatModelConstruction); err == nil {
 		t.Fatal("direct Messages validation unexpectedly accepted a nil cap")
 	}
 }
 
-func TestSnapshotConfigCopiesMaxTokens(t *testing.T) {
+func TestSnapshotMaxTokensCopiesValue(t *testing.T) {
 	maxTokens := 128
-	cfg := snapshotConfig(ChatModelConfig{MaxTokens: &maxTokens})
+	snapshot := snapshotMaxTokens(&maxTokens)
 	maxTokens = 256
-	if cfg.MaxTokens == nil {
+	if snapshot == nil {
 		t.Fatal("snapshot lost MaxTokens")
 	}
-	if got, want := *cfg.MaxTokens, 128; got != want {
+	if got, want := *snapshot, 128; got != want {
 		t.Fatalf("snapshot MaxTokens = %d, want %d", got, want)
 	}
-	if cfg.MaxTokens == &maxTokens {
+	if snapshot == &maxTokens {
 		t.Fatal("snapshot retained caller's MaxTokens pointer")
 	}
 }
 
-func TestNewAuthClientValidatesWithoutNetwork(t *testing.T) {
+func TestPrepareConfigValidatesWithoutNetwork(t *testing.T) {
 	t.Setenv("OPENCODE_GO_API_KEY", "")
+	baseConfig := ChatModelConfig{
+		Model:     "model-id",
+		Protocol:  ProtocolChatCompletions,
+		UserAgent: "host-agent/1.0",
+	}
 
-	client, err := newAuthClient(ChatModelConfig{UserAgent: "host-agent/1.0"})
-	if client != nil {
-		t.Fatal("newAuthClient returned a client without credentials")
+	prepared, err := prepareConfig(baseConfig, providerConstruction)
+	if prepared.authClient != nil {
+		t.Fatal("prepareConfig returned a client without credentials")
 	}
 	if !errors.Is(err, einoproviders.ErrProviderInit) ||
 		!errors.Is(err, einoproviders.ErrProviderAuth) ||
@@ -144,17 +138,15 @@ func TestNewAuthClientValidatesWithoutNetwork(t *testing.T) {
 
 	baseTransport := &countingRoundTripper{}
 	source := &http.Client{Transport: baseTransport}
-	client, err = newAuthClient(ChatModelConfig{
-		APIKey:     "explicit-key",
-		UserAgent:  "host-agent/1.0",
-		SessionID:  "conversation-1",
-		HTTPClient: source,
-	})
+	baseConfig.APIKey = "explicit-key"
+	baseConfig.SessionID = "conversation-1"
+	baseConfig.HTTPClient = source
+	prepared, err = prepareConfig(baseConfig, providerConstruction)
 	if err != nil {
-		t.Fatalf("newAuthClient() error = %v", err)
+		t.Fatalf("prepareConfig() error = %v", err)
 	}
-	if client == nil {
-		t.Fatal("newAuthClient returned nil")
+	if prepared.authClient == nil {
+		t.Fatal("prepareConfig returned nil auth client")
 	}
 	if baseTransport.calls != 0 {
 		t.Fatalf("construction made %d network calls", baseTransport.calls)
@@ -164,8 +156,111 @@ func TestNewAuthClientValidatesWithoutNetwork(t *testing.T) {
 	}
 }
 
-func TestNewAuthClientDelegatesConfigurationValidation(t *testing.T) {
+func TestPrepareConfigRejectsLocalConfiguration(t *testing.T) {
+	base := ChatModelConfig{
+		Model:     "model-id",
+		Protocol:  ProtocolChatCompletions,
+		APIKey:    "explicit-key",
+		UserAgent: "host-agent/1.0",
+	}
+	tests := []struct {
+		name         string
+		cfg          ChatModelConfig
+		construction constructionKind
+	}{
+		{name: "missing model", cfg: func() ChatModelConfig {
+			cfg := base
+			cfg.Model = " "
+			return cfg
+		}(), construction: providerConstruction},
+		{name: "unknown protocol", cfg: func() ChatModelConfig {
+			cfg := base
+			cfg.Protocol = "unknown"
+			return cfg
+		}(), construction: providerConstruction},
+		{name: "nonpositive cap", cfg: func() ChatModelConfig {
+			cfg := base
+			zero := 0
+			cfg.MaxTokens = &zero
+			return cfg
+		}(), construction: providerConstruction},
+		{name: "messages cap required", cfg: func() ChatModelConfig {
+			cfg := base
+			cfg.Protocol = ProtocolMessages
+			return cfg
+		}(), construction: chatModelConstruction},
+		{name: "unknown construction kind", cfg: base, construction: constructionKind(99)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prepared, err := prepareConfig(tt.cfg, tt.construction)
+			if prepared != (preparedConfig{}) {
+				t.Fatalf("prepareConfig() returned usable state for invalid config: %#v", prepared)
+			}
+			if !errors.Is(err, einoproviders.ErrProviderInit) {
+				t.Fatalf("prepareConfig() error = %v, want provider init identity", err)
+			}
+		})
+	}
+}
+
+func TestPrepareConfigUsesEnvironmentAndExplicitAPIKeys(t *testing.T) {
 	t.Setenv("OPENCODE_GO_API_KEY", "environment-key")
+
+	tests := []struct {
+		name    string
+		apiKey  string
+		wantKey string
+	}{
+		{name: "environment fallback", wantKey: "environment-key"},
+		{name: "explicit precedence", apiKey: "explicit-key", wantKey: "explicit-key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &countingRoundTripper{}
+			prepared, err := prepareConfig(ChatModelConfig{
+				Model:      "model-id",
+				Protocol:   ProtocolChatCompletions,
+				APIKey:     tt.apiKey,
+				UserAgent:  "host-agent/1.0",
+				SessionID:  "conversation-1",
+				BaseURL:    "https://api.example.test/v1",
+				HTTPClient: &http.Client{Transport: recorder},
+			}, providerConstruction)
+			if err != nil {
+				t.Fatalf("prepareConfig() error = %v", err)
+			}
+			client := prepared.authClient.HTTPClient()
+			endpoint, err := prepared.authClient.Endpoint(opencodeauth.ProtocolChatCompletions)
+			if err != nil {
+				t.Fatalf("Endpoint() error = %v", err)
+			}
+			req, err := http.NewRequest(http.MethodPost, endpoint, http.NoBody)
+			if err != nil {
+				t.Fatalf("NewRequest() error = %v", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("Do() error = %v", err)
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatalf("response Close() error = %v", err)
+			}
+			if got := recorder.authorization; got != "Bearer "+tt.wantKey {
+				t.Fatalf("Authorization = %q, want Bearer credential", got)
+			}
+		})
+	}
+}
+
+func TestPrepareConfigDelegatesAuthValidation(t *testing.T) {
+	t.Setenv("OPENCODE_GO_API_KEY", "environment-key")
+	base := ChatModelConfig{
+		APIKey:    "explicit-key",
+		Model:     "model-id",
+		Protocol:  ProtocolChatCompletions,
+		UserAgent: "host-agent/1.0",
+	}
 
 	tests := []struct {
 		name string
@@ -173,37 +268,74 @@ func TestNewAuthClientDelegatesConfigurationValidation(t *testing.T) {
 		want error
 	}{
 		{
+			name: "missing user agent",
+			cfg: func() ChatModelConfig {
+				cfg := base
+				cfg.UserAgent = ""
+				return cfg
+			}(),
+			want: opencodeauth.ErrInvalidConfiguration,
+		},
+		{
+			name: "whitespace user agent",
+			cfg: func() ChatModelConfig {
+				cfg := base
+				cfg.UserAgent = "  "
+				return cfg
+			}(),
+			want: opencodeauth.ErrInvalidConfiguration,
+		},
+		{
 			name: "invalid user agent syntax",
-			cfg:  ChatModelConfig{UserAgent: "host\nagent"},
+			cfg: func() ChatModelConfig {
+				cfg := base
+				cfg.UserAgent = "host\nagent"
+				return cfg
+			}(),
 			want: opencodeauth.ErrInvalidConfiguration,
 		},
 		{
 			name: "invalid session",
-			cfg:  ChatModelConfig{UserAgent: "host-agent/1.0", SessionID: "bad session"},
+			cfg: func() ChatModelConfig {
+				cfg := base
+				cfg.SessionID = "bad session"
+				return cfg
+			}(),
 			want: opencodeauth.ErrInvalidSessionID,
 		},
 		{
 			name: "invalid base URL",
-			cfg:  ChatModelConfig{UserAgent: "host-agent/1.0", BaseURL: "http://example.com"},
+			cfg: func() ChatModelConfig {
+				cfg := base
+				cfg.BaseURL = "http://example.com"
+				return cfg
+			}(),
 			want: opencodeauth.ErrInvalidConfiguration,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, err := newAuthClient(tt.cfg)
-			if client != nil || !errors.Is(err, tt.want) || !errors.Is(err, einoproviders.ErrProviderInit) {
-				t.Fatalf("newAuthClient() = (%v, %v), want nil init error matching %v", client, err, tt.want)
+			prepared, err := prepareConfig(tt.cfg, providerConstruction)
+			if prepared != (preparedConfig{}) || !errors.Is(err, tt.want) || !errors.Is(err, einoproviders.ErrProviderInit) {
+				t.Fatalf("prepareConfig() result/error = (%#v, %v), want zero init error matching %v", prepared, err, tt.want)
 			}
 		})
 	}
 }
 
 type countingRoundTripper struct {
-	calls int
+	calls         int
+	authorization string
 }
 
-func (t *countingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+func (t *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.calls++
-	return nil, errors.New("unexpected network request")
+	t.authorization = req.Header.Get("Authorization")
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+		Request:    req,
+	}, nil
 }

@@ -58,11 +58,19 @@ type ChatModelConfig struct {
 	MaxTokens *int
 }
 
+type constructionKind uint8
+
+const (
+	providerConstruction constructionKind = iota + 1
+	chatModelConstruction
+)
+
 // validateConfig checks the fields owned by this package. Authentication,
 // session, and endpoint syntax remain the responsibility of opencode-auth-go.
-// requireMessagesMaxTokens distinguishes direct Messages model construction
-// from Provider.Advise, which supplies its cap when it sends a request.
-func validateConfig(cfg ChatModelConfig, requireMessagesMaxTokens bool) error {
+func validateConfig(cfg ChatModelConfig, construction constructionKind) error {
+	if construction != providerConstruction && construction != chatModelConstruction {
+		return fmt.Errorf("opencodego: invalid construction kind")
+	}
 	if strings.TrimSpace(cfg.Model) == "" {
 		return fmt.Errorf("opencodego: Model is required")
 	}
@@ -76,33 +84,38 @@ func validateConfig(cfg ChatModelConfig, requireMessagesMaxTokens bool) error {
 		return fmt.Errorf("opencodego: unknown Protocol %q", cfg.Protocol)
 	}
 
-	if strings.TrimSpace(cfg.UserAgent) == "" {
-		return fmt.Errorf("opencodego: UserAgent is required")
-	}
 	if cfg.MaxTokens != nil && *cfg.MaxTokens <= 0 {
 		return fmt.Errorf("opencodego: MaxTokens must be > 0")
 	}
-	if requireMessagesMaxTokens && cfg.Protocol == ProtocolMessages && cfg.MaxTokens == nil {
+	if construction == chatModelConstruction && cfg.Protocol == ProtocolMessages && cfg.MaxTokens == nil {
 		return fmt.Errorf("opencodego: MaxTokens is required for Messages")
 	}
 	return nil
 }
 
-// snapshotConfig copies pointer-valued configuration owned by the caller so a
-// provider can retain an immutable cap for concurrent operations.
-func snapshotConfig(cfg ChatModelConfig) ChatModelConfig {
-	if cfg.MaxTokens != nil {
-		maxTokens := *cfg.MaxTokens
-		cfg.MaxTokens = &maxTokens
+func snapshotMaxTokens(value *int) *int {
+	if value == nil {
+		return nil
 	}
-	return cfg
+	snapshot := *value
+	return &snapshot
 }
 
-// newAuthClient constructs the immutable authentication owner used by every
-// protocol adapter. opencode-auth-go validates credentials, base URLs,
-// sessions, user-agent syntax, and the caller-supplied HTTP client without
-// performing network or filesystem I/O.
-func newAuthClient(cfg ChatModelConfig) (*opencodeauth.Client, error) {
+type preparedConfig struct {
+	model      string
+	protocol   Protocol
+	maxTokens  *int
+	authClient *opencodeauth.Client
+}
+
+// prepareConfig validates and snapshots local configuration before constructing
+// the immutable authentication owner used by every protocol adapter.
+// opencode-auth-go validates credentials, base URLs, sessions, user-agent
+// syntax, and the caller-supplied HTTP client without network or filesystem I/O.
+func prepareConfig(cfg ChatModelConfig, construction constructionKind) (preparedConfig, error) {
+	if err := validateConfig(cfg, construction); err != nil {
+		return preparedConfig{}, mapConstructorError(err)
+	}
 	client, err := opencodeauth.NewClient(opencodeauth.Options{
 		APIKey:     cfg.APIKey,
 		BaseURL:    cfg.BaseURL,
@@ -111,50 +124,29 @@ func newAuthClient(cfg ChatModelConfig) (*opencodeauth.Client, error) {
 		HTTPClient: cfg.HTTPClient,
 	})
 	if err != nil {
-		return nil, mapConstructorError(err)
+		return preparedConfig{}, mapConstructorError(err)
 	}
-	return client, nil
+	return preparedConfig{
+		model:      cfg.Model,
+		protocol:   cfg.Protocol,
+		maxTokens:  snapshotMaxTokens(cfg.MaxTokens),
+		authClient: client,
+	}, nil
 }
 
-type safeError struct {
-	message string
-	causes  []error
+type constructorError struct {
+	cause error
 }
 
-func (e *safeError) Error() string {
-	if e == nil || e.message == "" {
-		return "opencode-go: request failed"
-	}
-	return e.message
+func (*constructorError) Error() string {
+	return "opencode-go: build client failed"
 }
 
-func (e *safeError) Unwrap() []error {
+func (e *constructorError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
-	return e.causes
-}
-
-func safeFailure(operation string, causes ...error) error {
-	filtered := make([]error, 0, len(causes))
-	for _, cause := range causes {
-		if cause != nil {
-			filtered = append(filtered, cause)
-		}
-	}
-	return &safeError{
-		message: "opencode-go: " + safeOperationLabel(operation) + " failed",
-		causes:  filtered,
-	}
-}
-
-func safeOperationLabel(operation string) string {
-	switch operation {
-	case "build client", "build chat model", "advise", "generate", "stream", "receive", "request":
-		return operation
-	default:
-		return "request"
-	}
+	return e.cause
 }
 
 // mapConstructorError classifies construction failures without allowing an
@@ -164,7 +156,7 @@ func mapConstructorError(err error) error {
 	if err == nil {
 		return nil
 	}
-	safe := safeFailure("build client", err)
+	safe := &constructorError{cause: err}
 	if errors.Is(err, opencodeauth.ErrMissingAPIKey) {
 		return einoproviders.WrapInitError(einoproviders.WrapAuthError(safe))
 	}
