@@ -84,7 +84,7 @@ func TestBlankImportRegistersProviderAndAdvise(t *testing.T) {
 
 func TestProviderRejectsUnavailableProtocolsAtConstruction(t *testing.T) {
 	t.Setenv("OPENCODE_GO_API_KEY", "")
-	for _, protocol := range []string{"messages", "responses"} {
+	for _, protocol := range []string{"responses"} {
 		t.Run(protocol, func(t *testing.T) {
 			_, err := einoproviders.NewProvider(context.Background(), "opencode-go", "fixture", einoproviders.Options{
 				APIKey: "key", Protocol: protocol, UserAgent: "provider-test/1",

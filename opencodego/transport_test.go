@@ -26,6 +26,133 @@ type trackedBody struct {
 	closed int
 }
 
+func TestMessagesHTTPClientRoutesExactSDKURLBeforeAuthentication(t *testing.T) {
+	type markerKey struct{}
+	tests := []struct {
+		name        string
+		baseURL     string
+		wantSDKBase string
+		wantTarget  string
+	}{
+		{
+			name:        "default root",
+			wantSDKBase: "https://opencode.ai/zen/go/",
+			wantTarget:  opencodeauth.DefaultBaseURL + "/messages",
+		},
+		{
+			name:        "custom root without v1",
+			baseURL:     "https://api.example.test/custom",
+			wantSDKBase: "https://api.example.test" + messagesSDKRoutePrefix,
+			wantTarget:  "https://api.example.test/custom/messages",
+		},
+		{
+			name:        "custom trailing slash",
+			baseURL:     "https://api.example.test/custom/",
+			wantSDKBase: "https://api.example.test" + messagesSDKRoutePrefix,
+			wantTarget:  "https://api.example.test/custom/messages",
+		},
+		{
+			name:        "repeated path segments ending in v1",
+			baseURL:     "https://api.example.test/v1/repeated/v1/",
+			wantSDKBase: "https://api.example.test/v1/repeated/",
+			wantTarget:  "https://api.example.test/v1/repeated/v1/messages",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var recorded *http.Request
+			var body string
+			base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				recorded = req.Clone(req.Context())
+				payload, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read body: %v", err)
+				}
+				body = string(payload)
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+			})
+			authClient := mustAuthClient(t, opencodeauth.Options{
+				APIKey: "key", BaseURL: tt.baseURL, UserAgent: "route-test/1", SessionID: "session",
+				HTTPClient: &http.Client{Transport: base},
+			})
+			client, sdkBase, err := newMessagesHTTPClient(authClient)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sdkBase != tt.wantSDKBase {
+				t.Fatalf("SDK base = %q, want %q", sdkBase, tt.wantSDKBase)
+			}
+			ctx, _ := withOperationState(context.WithValue(context.Background(), markerKey{}, "kept"))
+			req := mustRequest(t, ctx, http.MethodPost, sdkBase+"v1/messages", strings.NewReader("payload"))
+			originalURL := req.URL.String()
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if recorded == nil || recorded.URL.String() != tt.wantTarget {
+				t.Fatalf("target request = %#v, want %q", recorded, tt.wantTarget)
+			}
+			if req.URL.String() != originalURL {
+				t.Fatalf("original request URL changed to %q", req.URL)
+			}
+			if recorded.Method != http.MethodPost || body != "payload" || recorded.Context().Value(markerKey{}) != "kept" || recorded.GetBody == nil {
+				t.Fatalf("request properties changed: method=%q body=%q context=%v", recorded.Method, body, recorded.Context().Value(markerKey{}))
+			}
+			if recorded.Header.Get("X-Api-Key") != "key" || recorded.Header.Get("Authorization") != "" || recorded.Header.Get("User-Agent") != "route-test/1" {
+				t.Fatalf("request was not authenticated after mapping: %#v", recorded.Header)
+			}
+		})
+	}
+}
+
+func TestMessagesHTTPClientRejectsOtherSyntheticSDKRoutes(t *testing.T) {
+	var calls int
+	authClient := mustAuthClient(t, opencodeauth.Options{
+		APIKey: "key", BaseURL: "https://api.example.test/custom", UserAgent: "route-test/1", SessionID: "session",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, errors.New("unexpected base transport call")
+		})},
+	})
+	client, sdkBase, err := newMessagesHTTPClient(authClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		method string
+		url    string
+		host   string
+	}{
+		{name: "path", method: http.MethodPost, url: sdkBase + "v1/messages/count_tokens"},
+		{name: "query", method: http.MethodPost, url: sdkBase + "v1/messages?beta=true"},
+		{name: "method", method: http.MethodGet, url: sdkBase + "v1/messages"},
+		{name: "origin", method: http.MethodPost, url: "https://other.example" + messagesSDKRoutePrefix + "v1/messages"},
+		{name: "host override", method: http.MethodPost, url: sdkBase + "v1/messages", host: "other.example"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &trackedBody{Reader: strings.NewReader("payload")}
+			req := mustRequest(t, context.Background(), tt.method, tt.url, body)
+			req.Host = tt.host
+			resp, err := client.Do(req)
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if !errors.Is(err, opencodeauth.ErrDisallowedRequest) {
+				t.Fatalf("other SDK route error = %v, want ErrDisallowedRequest", err)
+			}
+			if body.closeCount() != 1 {
+				t.Fatalf("request body close count = %d, want 1", body.closeCount())
+			}
+		})
+	}
+	if calls != 0 {
+		t.Fatalf("base transport calls = %d, want 0", calls)
+	}
+}
+
 func (b *trackedBody) Close() error {
 	b.mu.Lock()
 	b.closed++

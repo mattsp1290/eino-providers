@@ -6,12 +6,97 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	opencodeauth "github.com/mattsp1290/opencode-auth-go"
 )
 
 const sanitizedNativeError = `{"error":{"message":"OpenCode Go request failed","type":"api_error","code":"opencode_go_error"}}`
+
+const messagesSDKRoutePrefix = "/.opencodego/messages-sdk/"
+
+// newMessagesHTTPClient gives the Anthropic SDK a base URL that composes to
+// the auth client's exact Messages endpoint. Roots ending in /v1 compose
+// directly. Other valid roots use one private synthetic SDK route which is
+// mapped to the native endpoint before authentication.
+func newMessagesHTTPClient(authClient *opencodeauth.Client) (*http.Client, string, error) {
+	httpClient, err := newObservedHTTPClient(authClient)
+	if err != nil {
+		return nil, "", err
+	}
+	base, err := url.Parse(authClient.BaseURL())
+	if err != nil {
+		return nil, "", mapConstructorError(err)
+	}
+	targetText, err := authClient.Endpoint(opencodeauth.ProtocolMessages)
+	if err != nil {
+		return nil, "", mapConstructorError(err)
+	}
+	target, err := url.Parse(targetText)
+	if err != nil {
+		return nil, "", mapConstructorError(err)
+	}
+
+	if path.Base(base.Path) == "v1" {
+		sdkBase := *base
+		sdkBase.Path = strings.TrimSuffix(base.Path, "v1")
+		sdkBase.RawPath = ""
+		sdkBase.RawQuery = ""
+		sdkBase.Fragment = ""
+		return httpClient, sdkBase.String(), nil
+	}
+
+	sdkBase := &url.URL{Scheme: base.Scheme, Host: base.Host, Path: messagesSDKRoutePrefix}
+	source := sdkBase.ResolveReference(&url.URL{Path: "v1/messages"})
+	httpClient.Transport = &exactRouteTransport{
+		next:   httpClient.Transport,
+		source: source,
+		target: target,
+	}
+	return httpClient, sdkBase.String(), nil
+}
+
+// exactRouteTransport is private to the Messages adapter. It rejects every
+// SDK route except the one request path that the adapter supports.
+type exactRouteTransport struct {
+	next   http.RoundTripper
+	source *url.URL
+	target *url.URL
+}
+
+func (t *exactRouteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil || t == nil || t.next == nil || t.source == nil || t.target == nil {
+		closeRequestBody(req)
+		return nil, opencodeauth.ErrDisallowedRequest
+	}
+	if req.Method != http.MethodPost || req.URL.String() != t.source.String() || (req.Host != "" && req.Host != t.source.Host) {
+		closeRequestBody(req)
+		return nil, opencodeauth.ErrDisallowedRequest
+	}
+	mapped := req.Clone(req.Context())
+	target := *t.target
+	mapped.URL = &target
+	return t.next.RoundTrip(mapped)
+}
+
+func closeRequestBody(req *http.Request) {
+	if req != nil && req.Body != nil {
+		_ = req.Body.Close()
+	}
+}
+
+func (t *exactRouteTransport) CloseIdleConnections() {
+	if t == nil {
+		return
+	}
+	if closer, ok := t.next.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+var _ http.RoundTripper = (*exactRouteTransport)(nil)
 
 // newObservedHTTPClient copies the auth client's fresh HTTP client and adds
 // local response observation outside its authenticated transport. Client
