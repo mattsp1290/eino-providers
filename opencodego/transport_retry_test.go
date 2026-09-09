@@ -21,11 +21,13 @@ const retryTestBaseURL = "https://api.example.test/v1"
 func TestMessagesSDKUsesDefaultRetryLimitAndRetryAfter(t *testing.T) {
 	var retryCounts []string
 	var attempts []time.Time
-	client := newRetryTestMessagesClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	httpClient := newRetryTestObservedHTTPClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		retryCounts = append(retryCounts, req.Header.Get("X-Stainless-Retry-Count"))
 		attempts = append(attempts, time.Now())
 		return retryTestResponse(req, http.StatusTooManyRequests, http.Header{"Retry-After": {"0.02"}}), nil
 	}))
+	doer := &retryResponseHeaderDoer{next: httpClient}
+	client := newRetryTestMessagesClientWithHTTPDoer(doer)
 
 	err := callRetryTestMessages(context.Background(), &client)
 	if err == nil {
@@ -33,6 +35,9 @@ func TestMessagesSDKUsesDefaultRetryLimitAndRetryAfter(t *testing.T) {
 	}
 	if want := []string{"0", "1", "2"}; !reflect.DeepEqual(retryCounts, want) {
 		t.Fatalf("retry count headers = %v, want %v", retryCounts, want)
+	}
+	if want := []string{"0.02", "0.02", "0.02"}; !reflect.DeepEqual(doer.retryAfter, want) {
+		t.Fatalf("SDK-visible Retry-After headers = %v, want %v", doer.retryAfter, want)
 	}
 	for i := 1; i < len(attempts); i++ {
 		gap := attempts[i].Sub(attempts[i-1])
@@ -257,6 +262,19 @@ type retryCloseSignalDoer struct {
 	next   option.HTTPClient
 	closed chan struct{}
 	once   sync.Once
+}
+
+type retryResponseHeaderDoer struct {
+	next       option.HTTPClient
+	retryAfter []string
+}
+
+func (d *retryResponseHeaderDoer) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.next.Do(req)
+	if resp != nil {
+		d.retryAfter = append(d.retryAfter, resp.Header.Get("Retry-After"))
+	}
+	return resp, err
 }
 
 func (d *retryCloseSignalDoer) Do(req *http.Request) (*http.Response, error) {
