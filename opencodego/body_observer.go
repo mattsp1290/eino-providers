@@ -173,7 +173,7 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 	}
 	switch o.protocol {
 	case terminalChatCompletions:
-		if bytes.Equal(bytes.TrimSpace(o.eventData), []byte("[DONE]")) {
+		if bytes.Equal(o.eventData, []byte("[DONE]")) {
 			return true, nil
 		}
 		if len(o.eventData) > 0 && !json.Valid(o.eventData) {
@@ -192,7 +192,7 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 		if err := json.Unmarshal(o.eventData, &envelope); err != nil {
 			return false, errMalformedSSE
 		}
-		if o.eventType == "message_stop" && envelope.Type != "" && envelope.Type != "message_stop" {
+		if o.eventType == "message_stop" && envelope.Type != "message_stop" {
 			return false, errMalformedSSE
 		}
 		if o.eventType == "message_stop" || envelope.Type == "message_stop" {
