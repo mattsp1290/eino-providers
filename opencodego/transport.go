@@ -55,7 +55,7 @@ func (t *observingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, errors.New("opencode-go transport returned no response")
 	}
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-		observeTerminalBody(req, resp)
+		observeResponseBody(req, resp, state)
 		return resp, nil
 	}
 
@@ -72,21 +72,27 @@ func (t *observingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	return sanitizedErrorResponse(resp), nil
 }
 
-func observeTerminalBody(req *http.Request, resp *http.Response) {
+func observeResponseBody(req *http.Request, resp *http.Response, state *operationState) {
 	if req == nil || resp == nil || resp.Body == nil {
 		return
 	}
-	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
-		return
-	}
 	path := strings.TrimSuffix(req.URL.Path, "/")
+	var protocol terminalProtocol
 	switch {
 	case strings.HasSuffix(path, "/chat/completions"):
-		resp.Body = newTerminalBodyObserver(resp.Body, terminalChatCompletions)
+		protocol = terminalChatCompletions
 	case strings.HasSuffix(path, "/messages"):
-		resp.Body = newTerminalBodyObserver(resp.Body, terminalMessages)
+		protocol = terminalMessages
+	default:
+		return
 	}
+
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err == nil && strings.EqualFold(mediaType, "text/event-stream") {
+		resp.Body = newTerminalBodyObserver(resp.Body, protocol, state)
+		return
+	}
+	resp.Body = newObservedJSONBody(resp.Body, protocol, state)
 }
 
 func sanitizedErrorResponse(source *http.Response) *http.Response {

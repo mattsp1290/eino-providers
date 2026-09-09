@@ -13,6 +13,27 @@ import (
 type operationState struct {
 	mu            sync.RWMutex
 	lastHTTPError *opencodeauth.HTTPError
+	body          bodyObservation
+	attempt       uint64
+}
+
+type observedCount struct {
+	value   int
+	present bool
+}
+
+type wireUsageObservation struct {
+	input     observedCount
+	output    observedCount
+	total     observedCount
+	cached    observedCount
+	reasoning observedCount
+}
+
+type bodyObservation struct {
+	usage    wireUsageObservation
+	terminal bool
+	err      error
 }
 
 type operationStateContextKey struct{}
@@ -43,7 +64,9 @@ func (s *operationState) beginAttempt() {
 		return
 	}
 	s.mu.Lock()
+	s.attempt++
 	s.lastHTTPError = nil
+	s.body = bodyObservation{}
 	s.mu.Unlock()
 }
 
@@ -72,4 +95,42 @@ func (s *operationState) httpError() *opencodeauth.HTTPError {
 	}
 	copy := *s.lastHTTPError
 	return &copy
+}
+
+func (s *operationState) updateBody(update func(*bodyObservation)) {
+	if s == nil || update == nil {
+		return
+	}
+	s.mu.Lock()
+	update(&s.body)
+	s.mu.Unlock()
+}
+
+func (s *operationState) attemptID() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.attempt
+}
+
+func (s *operationState) updateBodyForAttempt(attempt uint64, update func(*bodyObservation)) {
+	if s == nil || update == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.attempt == attempt {
+		update(&s.body)
+	}
+	s.mu.Unlock()
+}
+
+func (s *operationState) bodySnapshot() bodyObservation {
+	if s == nil {
+		return bodyObservation{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.body
 }
