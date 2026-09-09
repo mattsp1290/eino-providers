@@ -74,6 +74,32 @@ func TestMapInvocationErrorHTTPClassification(t *testing.T) {
 	}
 }
 
+func TestMapInvocationErrorClassifiesDirectHTTPError(t *testing.T) {
+	tests := []struct {
+		name      string
+		httpError *opencodeauth.HTTPError
+		wantClass einoproviders.ErrorClass
+	}{
+		{name: "authentication kind", httpError: &opencodeauth.HTTPError{StatusCode: 400, Kind: opencodeauth.ErrorKindAuthentication}, wantClass: einoproviders.ErrorClassProviderAuth},
+		{name: "quota kind", httpError: &opencodeauth.HTTPError{StatusCode: 429, Kind: opencodeauth.ErrorKindQuota}, wantClass: einoproviders.ErrorClassProviderAuth},
+		{name: "unknown unauthorized", httpError: &opencodeauth.HTTPError{StatusCode: 401, Kind: opencodeauth.ErrorKindUnknown}, wantClass: einoproviders.ErrorClassProviderAuth},
+		{name: "unknown forbidden", httpError: &opencodeauth.HTTPError{StatusCode: 403, Kind: opencodeauth.ErrorKindUnknown}, wantClass: einoproviders.ErrorClassProviderAuth},
+		{name: "policy forbidden", httpError: &opencodeauth.HTTPError{StatusCode: 403, Kind: opencodeauth.ErrorKindPolicy}, wantClass: einoproviders.ErrorClassProviderAPI},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mapInvocationError(operationRequest, tt.httpError, nil)
+			if got := einoproviders.Classify(err); got != tt.wantClass {
+				t.Fatalf("Classify(error) = %v, want %v", got, tt.wantClass)
+			}
+			var preserved *opencodeauth.HTTPError
+			if !errors.As(err, &preserved) || preserved != tt.httpError {
+				t.Fatalf("typed HTTP error = %#v, want original %#v", preserved, tt.httpError)
+			}
+		})
+	}
+}
+
 func TestMapInvocationErrorLocalAndContextFailures(t *testing.T) {
 	timeoutCause := &net.DNSError{IsTimeout: true}
 	tests := []struct {
@@ -106,7 +132,7 @@ func TestMapInvocationErrorLocalAndContextFailures(t *testing.T) {
 func TestSafeOperationLabelsDoNotEchoInput(t *testing.T) {
 	cause := errors.New("body-secret")
 	err := safeFailure(invocationOperation(255), cause)
-	if got, want := err.Error(), "opencode-go: request failed"; got != want {
+	if got, want := err.Error(), "opencode-go: unknown failed"; got != want {
 		t.Fatalf("error = %q, want %q", got, want)
 	}
 	if !errors.Is(err, cause) {

@@ -57,11 +57,16 @@ func (t *observingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return resp, nil
 	}
 
+	statusCode := resp.StatusCode
 	decoded := opencodeauth.DecodeHTTPError(resp)
 	var httpErr *opencodeauth.HTTPError
-	if errors.As(decoded, &httpErr) {
-		state.recordHTTPError(httpErr)
+	if !errors.As(decoded, &httpErr) {
+		httpErr = &opencodeauth.HTTPError{
+			StatusCode: statusCode,
+			Kind:       opencodeauth.ErrorKindUnknown,
+		}
 	}
+	state.recordHTTPError(httpErr)
 	return sanitizedErrorResponse(resp), nil
 }
 
@@ -69,13 +74,9 @@ func sanitizedErrorResponse(source *http.Response) *http.Response {
 	body := []byte(sanitizedNativeError)
 	copy := new(http.Response)
 	*copy = *source
-	copy.Header = source.Header.Clone()
-	if copy.Header == nil {
-		copy.Header = make(http.Header)
-	}
-	removeHeader(copy.Header, "Content-Type")
-	removeHeader(copy.Header, "Content-Encoding")
-	removeHeader(copy.Header, "Content-Length")
+	copy.Header = make(http.Header)
+	copyHeaderValues(source.Header, copy.Header, "Retry-After")
+	copyHeaderValues(source.Header, copy.Header, "X-Should-Retry")
 	copy.Header.Set("Content-Type", "application/json")
 	copy.Body = io.NopCloser(bytes.NewReader(body))
 	copy.ContentLength = int64(len(body))
@@ -85,10 +86,12 @@ func sanitizedErrorResponse(source *http.Response) *http.Response {
 	return copy
 }
 
-func removeHeader(header http.Header, name string) {
-	for key := range header {
+func copyHeaderValues(source, destination http.Header, name string) {
+	for key, values := range source {
 		if strings.EqualFold(key, name) {
-			delete(header, key)
+			for _, value := range values {
+				destination.Add(name, value)
+			}
 		}
 	}
 }

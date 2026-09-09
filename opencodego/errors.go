@@ -34,9 +34,18 @@ func (o invocationOperation) label() string {
 	case operationRequest:
 		return "request"
 	default:
-		return "request"
+		return "unknown"
 	}
 }
+
+type invocationClass uint8
+
+const (
+	invocationCanceled invocationClass = iota + 1
+	invocationTimeout
+	invocationAuth
+	invocationAPI
+)
 
 type invocationError struct {
 	operation invocationOperation
@@ -78,37 +87,46 @@ func mapInvocationError(operation invocationOperation, err error, state *operati
 	causes := []error{err}
 	if httpErr != nil {
 		causes = append(causes, httpErr)
+	} else {
+		_ = errors.As(err, &httpErr)
 	}
 
-	if errors.Is(err, context.Canceled) {
+	switch classifyInvocationError(err, httpErr) {
+	case invocationCanceled:
 		return safeFailure(operation, causes...)
-	}
-	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+	case invocationTimeout:
 		return safeFailure(operation, append([]error{einoproviders.ErrProviderTimeout}, causes...)...)
-	}
-
-	if httpErr != nil {
-		switch httpErr.Kind {
-		case opencodeauth.ErrorKindAuthentication, opencodeauth.ErrorKindQuota:
-			return einoproviders.WrapAuthError(safeFailure(operation, causes...))
-		case opencodeauth.ErrorKindPolicy:
-			return safeFailure(operation, append([]error{einoproviders.ErrProviderAPI}, causes...)...)
-		}
-		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
-			return einoproviders.WrapAuthError(safeFailure(operation, causes...))
-		}
-		return safeFailure(operation, append([]error{einoproviders.ErrProviderAPI}, causes...)...)
-	}
-
-	if errors.Is(err, opencodeauth.ErrMissingAPIKey) {
+	case invocationAuth:
 		return einoproviders.WrapAuthError(safeFailure(operation, causes...))
-	}
-	if errors.Is(err, opencodeauth.ErrMissingSessionID) ||
-		errors.Is(err, opencodeauth.ErrInvalidSessionID) ||
-		errors.Is(err, opencodeauth.ErrDisallowedRequest) {
+	case invocationAPI:
 		return safeFailure(operation, append([]error{einoproviders.ErrProviderAPI}, causes...)...)
 	}
 	return safeFailure(operation, append([]error{einoproviders.ErrProviderAPI}, causes...)...)
+}
+
+func classifyInvocationError(err error, httpErr *opencodeauth.HTTPError) invocationClass {
+	if errors.Is(err, context.Canceled) {
+		return invocationCanceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
+		return invocationTimeout
+	}
+	if httpErr != nil {
+		switch httpErr.Kind {
+		case opencodeauth.ErrorKindAuthentication, opencodeauth.ErrorKindQuota:
+			return invocationAuth
+		case opencodeauth.ErrorKindPolicy:
+			return invocationAPI
+		}
+		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden {
+			return invocationAuth
+		}
+		return invocationAPI
+	}
+	if errors.Is(err, opencodeauth.ErrMissingAPIKey) {
+		return invocationAuth
+	}
+	return invocationAPI
 }
 
 func isTimeout(err error) bool {
