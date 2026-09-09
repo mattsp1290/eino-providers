@@ -40,12 +40,6 @@ func TestTerminalBodyObserverPreservesBytesThroughTerminal(t *testing.T) {
 			want:     ": ping\r\ndata: {\"choices\":\r\ndata: []}\r\n\r\ndata: [DONE]\r\n\r\n",
 		},
 		{
-			name:     "messages JSON terminal",
-			protocol: terminalMessages,
-			body:     "data: {\"type\":\"content_block_delta\"}\n\ndata: {\"type\":\"message_stop\"}\n\npost-terminal",
-			want:     "data: {\"type\":\"content_block_delta\"}\n\ndata: {\"type\":\"message_stop\"}\n\n",
-		},
-		{
 			name:     "messages event terminal",
 			protocol: terminalMessages,
 			body:     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\nignored",
@@ -84,6 +78,7 @@ func TestTerminalBodyObserverFailsIncompleteAndMalformedStreams(t *testing.T) {
 		{name: "spaced chat marker", protocol: terminalChatCompletions, body: "data:   [DONE]\n\n", wantErr: errMalformedSSE},
 		{name: "mismatched message stop", protocol: terminalMessages, body: "event: message_stop\ndata: {\"type\":\"message_delta\"}\n\n", wantErr: errMalformedSSE},
 		{name: "reverse mismatched message stop", protocol: terminalMessages, body: "event: message_delta\ndata: {\"type\":\"message_stop\"}\n\n", wantErr: errMalformedSSE},
+		{name: "message stop missing native event", protocol: terminalMessages, body: "data: {\"type\":\"message_stop\"}\n\n", wantErr: errMalformedSSE},
 		{name: "missing message stop payload type", protocol: terminalMessages, body: "event: message_stop\ndata: {}\n\n", wantErr: errMalformedSSE},
 	}
 	for _, tt := range tests {

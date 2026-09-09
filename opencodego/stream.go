@@ -18,6 +18,24 @@ var (
 	errOversizedJSONObservation = errors.New("opencode-go: response exceeds observation size limit")
 )
 
+type observedBodySource struct {
+	io.ReadCloser
+	closeOnce sync.Once
+}
+
+func newObservedBodySource(source io.ReadCloser) *observedBodySource {
+	if source == nil {
+		source = io.NopCloser(bytes.NewReader(nil))
+	}
+	return &observedBodySource{ReadCloser: source}
+}
+
+func (s *observedBodySource) Close() error {
+	var err error
+	s.closeOnce.Do(func() { err = s.ReadCloser.Close() })
+	return err
+}
+
 func observedUsageTokenUsage(observation bodyObservation) *schema.TokenUsage {
 	u := observation.usage
 	if !u.input.present || !u.output.present {
@@ -240,11 +258,10 @@ func observedJSONCount(values map[string]json.RawMessage, key string) (observedC
 }
 
 type observedJSONBody struct {
-	source    io.ReadCloser
+	source    *observedBodySource
 	protocol  terminalProtocol
 	state     *operationState
 	attempt   uint64
-	closeOnce sync.Once
 	mu        sync.Mutex
 	buffer    []byte
 	pending   error
@@ -252,10 +269,7 @@ type observedJSONBody struct {
 }
 
 func newObservedJSONBody(source io.ReadCloser, protocol terminalProtocol, state *operationState) io.ReadCloser {
-	if source == nil {
-		source = io.NopCloser(bytes.NewReader(nil))
-	}
-	return &observedJSONBody{source: source, protocol: protocol, state: state, attempt: state.attemptID()}
+	return &observedJSONBody{source: newObservedBodySource(source), protocol: protocol, state: state, attempt: state.attemptID()}
 }
 
 func (o *observedJSONBody) Read(p []byte) (int, error) {
@@ -322,9 +336,7 @@ func (o *observedJSONBody) Close() error {
 }
 
 func (o *observedJSONBody) closeSource() error {
-	var err error
-	o.closeOnce.Do(func() { err = o.source.Close() })
-	return err
+	return o.source.Close()
 }
 
 func (o *observedJSONBody) finalize() {

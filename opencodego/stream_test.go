@@ -304,6 +304,30 @@ func TestTerminalBodyObserverCapturesMessagesCumulativeUsage(t *testing.T) {
 	})
 }
 
+func TestTerminalBodyObserverMessagesUsagePresence(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		usage string
+		want  *schema.TokenUsage
+	}{
+		{name: "omitted", usage: ""},
+		{name: "null", usage: `"usage":null`},
+		{name: "partial", usage: `"usage":{"input_tokens":0}`},
+		{name: "explicit zero", usage: `"usage":{"input_tokens":0,"output_tokens":0}`, want: &schema.TokenUsage{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{" + tt.usage + "}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+			state := &operationState{}
+			_, err := io.ReadAll(newTerminalBodyObserver(io.NopCloser(strings.NewReader(body)), terminalMessages, state))
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertTokenUsage(t, observedUsageTokenUsage(state.bodySnapshot()), tt.want)
+		})
+	}
+}
+
 func TestTerminalBodyObserverUsagePresenceAndErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -331,19 +355,99 @@ func TestTerminalBodyObserverUsagePresenceAndErrors(t *testing.T) {
 }
 
 func TestTerminalBodyObserverCompletesWithoutSocketEOF(t *testing.T) {
-	source := newTerminalThenBlockBody("data: [DONE]\n\n")
-	done := make(chan error, 1)
-	go func() {
-		_, err := io.ReadAll(newTerminalBodyObserver(source, terminalChatCompletions, &operationState{}))
-		done <- err
-	}()
-	select {
-	case err := <-done:
+	for _, tt := range []struct {
+		protocol terminalProtocol
+		body     string
+	}{
+		{terminalChatCompletions, "data: [DONE]\n\n"},
+		{terminalMessages, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"},
+	} {
+		source := newTerminalThenBlockBody(tt.body)
+		done := make(chan error, 1)
+		go func() {
+			_, err := io.ReadAll(newTerminalBodyObserver(source, tt.protocol, &operationState{}))
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("observer waited for socket EOF after terminal frame")
+		}
+		if source.closeCount() != 1 {
+			t.Fatalf("close count = %d, want 1", source.closeCount())
+		}
+	}
+}
+
+func TestTerminalBodyObserverAcceptsExactEventLimit(t *testing.T) {
+	prefix, suffix := "data: {\"x\":\"", "\"}\n\n"
+	event := prefix + strings.Repeat("x", maxObservedSSEEventBytes-len(prefix)-len(suffix)) + suffix
+	body := event + "data: [DONE]\n\n"
+	got, err := io.ReadAll(newTerminalBodyObserver(io.NopCloser(strings.NewReader(body)), terminalChatCompletions))
+	if err != nil || len(got) != len(body) {
+		t.Fatalf("exact-limit event: bytes = %d, error = %v", len(got), err)
+	}
+}
+
+func TestObservingTransportResetsUsageAcrossAttempts(t *testing.T) {
+	responses := []string{
+		`{"usage":{"prompt_tokens":90,"completion_tokens":90}}`,
+		`{"usage":{"prompt_tokens":2,"completion_tokens":3}}`,
+	}
+	attempt := 0
+	transport := &observingTransport{next: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if attempt == len(responses) {
+			return nil, errors.New("network failure")
+		}
+		body := responses[attempt]
+		attempt++
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+	ctx, state := withOperationState(context.Background())
+	request := func() *http.Request {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://example.test/v1/chat/completions", nil)
+		return req
+	}
+	for range responses {
+		resp, err := transport.RoundTrip(request())
 		if err != nil {
 			t.Fatal(err)
 		}
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	assertTokenUsage(t, observedUsageTokenUsage(state.bodySnapshot()), &schema.TokenUsage{PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5})
+	resp, err := transport.RoundTrip(request())
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("network attempt succeeded")
+	}
+	if got := state.bodySnapshot(); got != (bodyObservation{}) {
+		t.Fatalf("network attempt retained stale usage: %#v", got)
+	}
+}
+
+func TestObservedJSONBodyConcurrentCloseUnblocksRead(t *testing.T) {
+	source := newTerminalThenBlockBody(`{"usage":`)
+	body := newObservedJSONBody(source, terminalChatCompletions, &operationState{})
+	buffer := make([]byte, 32)
+	if n, err := body.Read(buffer); n == 0 || err != nil {
+		t.Fatalf("initial Read() = %d, %v", n, err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := body.Read(buffer); done <- err }()
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("observer waited for socket EOF after terminal frame")
+		t.Fatal("Close did not unblock concurrent Read")
 	}
 	if source.closeCount() != 1 {
 		t.Fatalf("close count = %d, want 1", source.closeCount())

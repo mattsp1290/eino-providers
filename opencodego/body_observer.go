@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"sync"
 	"sync/atomic"
 )
 
@@ -28,13 +27,12 @@ const (
 // native terminal event. It then closes the network body and supplies EOF to
 // the SDK without waiting for the peer to close the connection.
 type terminalBodyObserver struct {
-	source    io.ReadCloser
-	protocol  terminalProtocol
-	state     *operationState
-	attempt   uint64
-	closeOnce sync.Once
-	closed    atomic.Bool
-	terminal  atomic.Bool
+	source   *observedBodySource
+	protocol terminalProtocol
+	state    *operationState
+	attempt  uint64
+	closed   atomic.Bool
+	terminal atomic.Bool
 
 	line       []byte
 	eventData  []byte
@@ -46,14 +44,11 @@ type terminalBodyObserver struct {
 }
 
 func newTerminalBodyObserver(source io.ReadCloser, protocol terminalProtocol, states ...*operationState) io.ReadCloser {
-	if source == nil {
-		source = io.NopCloser(bytes.NewReader(nil))
-	}
 	var state *operationState
 	if len(states) > 0 {
 		state = states[0]
 	}
-	return &terminalBodyObserver{source: source, protocol: protocol, state: state, attempt: state.attemptID()}
+	return &terminalBodyObserver{source: newObservedBodySource(source), protocol: protocol, state: state, attempt: state.attemptID()}
 }
 
 func (o *terminalBodyObserver) Read(p []byte) (int, error) {
@@ -112,12 +107,8 @@ func (o *terminalBodyObserver) Close() error {
 }
 
 func (o *terminalBodyObserver) closeSource() error {
-	var err error
-	o.closeOnce.Do(func() {
-		o.closed.Store(true)
-		err = o.source.Close()
-	})
-	return err
+	o.closed.Store(true)
+	return o.source.Close()
 }
 
 func (o *terminalBodyObserver) streamReadError(err error) error {
@@ -216,10 +207,10 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 		if o.eventType == "message_stop" && envelope.Type != "message_stop" {
 			return false, errMalformedSSE
 		}
-		if envelope.Type == "message_stop" && o.eventType != "" && o.eventType != "message_stop" {
+		if envelope.Type == "message_stop" && o.eventType != "message_stop" {
 			return false, errMalformedSSE
 		}
-		if o.eventType == "message_stop" || envelope.Type == "message_stop" {
+		if o.eventType == "message_stop" && envelope.Type == "message_stop" {
 			return true, nil
 		}
 	default:
