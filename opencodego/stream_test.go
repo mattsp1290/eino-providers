@@ -581,7 +581,7 @@ func TestNormalizeObservedStreamReplacesSDKUsageOnce(t *testing.T) {
 		},
 		{ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{PromptTokens: 99}}},
 	})
-	stream := normalizeObservedStream(source, state)
+	stream := normalizeObservedStream(context.Background(), source, state)
 	defer stream.Close()
 
 	first, err := stream.Recv()
@@ -621,7 +621,7 @@ func TestNormalizeObservedStreamForwardsReceiveErrorWithoutUsage(t *testing.T) {
 		t.Fatal("source closed before error")
 	}
 	writer.Close()
-	stream := normalizeObservedStream(source, state)
+	stream := normalizeObservedStream(context.Background(), source, state)
 	defer stream.Close()
 
 	message, err := stream.Recv()
@@ -637,10 +637,54 @@ func TestNormalizeObservedStreamForwardsReceiveErrorWithoutUsage(t *testing.T) {
 }
 
 func TestNormalizeObservedStreamRejectsNilSource(t *testing.T) {
-	stream := normalizeObservedStream(nil, &operationState{})
+	stream := normalizeObservedStream(context.Background(), nil, &operationState{})
 	defer stream.Close()
 	if message, err := stream.Recv(); message != nil || !errors.Is(err, errMissingSSETerminal) {
 		t.Fatalf("Recv() = %#v, %v", message, err)
+	}
+}
+
+func TestNormalizeObservedStreamCancellationClosesBlockedSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	source, writer := schema.Pipe[*schema.Message](0)
+	upstreamDone := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		writer.Close()
+		close(upstreamDone)
+	}()
+	stream := normalizeObservedStream(ctx, source, &operationState{})
+	done := make(chan error, 1)
+	go func() { _, err := stream.Recv(); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Recv() error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not release blocked source receive")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(time.Second):
+		t.Fatal("upstream producer did not terminate after cancellation")
+	}
+	stream.Close()
+}
+
+func TestNormalizeObservedStreamSkipsNilChunk(t *testing.T) {
+	state := &operationState{}
+	state.updateBody(func(observation *bodyObservation) { observation.terminal = true })
+	source := schema.StreamReaderFromArray([]*schema.Message{nil, {Content: "after nil"}})
+	stream := normalizeObservedStream(context.Background(), source, state)
+	defer stream.Close()
+	message, err := stream.Recv()
+	if err != nil || message.Content != "after nil" {
+		t.Fatalf("Recv() = %#v, %v", message, err)
+	}
+	if message, err = stream.Recv(); message != nil || !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal Recv() = %#v, %v", message, err)
 	}
 }
 
@@ -655,7 +699,7 @@ func TestNormalizeObservedStreamRejectsUnverifiedCompletion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stream := normalizeObservedStream(schema.StreamReaderFromArray([]*schema.Message{{Content: "prior"}}), tt.state)
+			stream := normalizeObservedStream(context.Background(), schema.StreamReaderFromArray([]*schema.Message{{Content: "prior"}}), tt.state)
 			defer stream.Close()
 			message, err := stream.Recv()
 			if err != nil || message.Content != "prior" {

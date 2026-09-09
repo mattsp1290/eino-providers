@@ -2,9 +2,11 @@ package opencodego
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strconv"
 	"sync"
 
@@ -380,7 +382,7 @@ func normalizeGeneratedUsage(message *schema.Message, state *operationState) err
 	return nil
 }
 
-func normalizeObservedStream(source *schema.StreamReader[*schema.Message], state *operationState) *schema.StreamReader[*schema.Message] {
+func normalizeObservedStream(ctx context.Context, source *schema.StreamReader[*schema.Message], state *operationState) *schema.StreamReader[*schema.Message] {
 	reader, writer := schema.Pipe[*schema.Message](1)
 	go func() {
 		defer writer.Close()
@@ -388,9 +390,20 @@ func normalizeObservedStream(source *schema.StreamReader[*schema.Message], state
 			_ = writer.Send(nil, errMissingSSETerminal)
 			return
 		}
-		defer source.Close()
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		var closeSourceOnce sync.Once
+		closeSource := func() { closeSourceOnce.Do(source.Close) }
+		stopCancellation := context.AfterFunc(ctx, closeSource)
+		defer stopCancellation()
+		defer closeSource()
 		for {
 			message, err := source.Recv()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = writer.Send(nil, ctxErr)
+				return
+			}
 			if errors.Is(err, io.EOF) {
 				observation := state.bodySnapshot()
 				if observation.err != nil {
@@ -425,11 +438,12 @@ func messageWithoutUsage(message *schema.Message) (*schema.Message, bool) {
 	copy := *message
 	meta := *message.ResponseMeta
 	meta.Usage = nil
-	copy.ResponseMeta = &meta
-	if meta.FinishReason == "" && meta.LogProbs == nil && copy.Role == "" && copy.Content == "" &&
-		len(copy.MultiContent) == 0 && len(copy.UserInputMultiContent) == 0 && len(copy.AssistantGenMultiContent) == 0 &&
-		copy.Name == "" && len(copy.ToolCalls) == 0 && copy.ToolCallID == "" && copy.ToolName == "" &&
-		copy.ReasoningContent == "" && len(copy.Extra) == 0 {
+	if meta == (schema.ResponseMeta{}) {
+		copy.ResponseMeta = nil
+	} else {
+		copy.ResponseMeta = &meta
+	}
+	if reflect.DeepEqual(copy, schema.Message{}) {
 		return nil, false
 	}
 	return &copy, true
