@@ -14,7 +14,9 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 	opencodeauth "github.com/mattsp1290/opencode-auth-go"
+	orderedmap "github.com/wk8/go-ordered-map/v2"
 
 	einoproviders "github.com/mattsp1290/eino-providers"
 )
@@ -154,6 +156,68 @@ func TestChatModelWithToolsCanClearDerivedModel(t *testing.T) {
 	defer mu.Unlock()
 	if fmt.Sprint(toolCounts) != "[1 0 0]" {
 		t.Fatalf("tool counts = %v, want [1 0 0]", toolCounts)
+	}
+}
+
+func TestChatModelPerCallToolsOwnCallerSchema(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if request.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"id\":\"id\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"id","object":"chat.completion","created":0,"model":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	cm := newTestChatModel(t, server, "session", nil)
+
+	properties := orderedmap.New[string, *jsonschema.Schema]()
+	properties.Set("z", &jsonschema.Schema{Type: "string"})
+	properties.Set("a", &jsonschema.Schema{Type: "string"})
+	parameters := &jsonschema.Schema{Type: "object", Properties: properties, Required: []string{"z", "a"}}
+	tools := []*schema.ToolInfo{{Name: "owned", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(parameters)}}
+	option := model.WithTools(tools)
+
+	const operations = 8
+	errs := make(chan error, operations)
+	for i := 0; i < operations; i++ {
+		go func(streaming bool) {
+			if !streaming {
+				_, err := cm.Generate(context.Background(), []*schema.Message{schema.UserMessage("hi")}, option)
+				errs <- err
+				return
+			}
+			stream, err := cm.Stream(context.Background(), []*schema.Message{schema.UserMessage("hi")}, option)
+			if err == nil {
+				for {
+					_, receiveErr := stream.Recv()
+					if errors.Is(receiveErr, io.EOF) {
+						break
+					}
+					if receiveErr != nil {
+						err = receiveErr
+						break
+					}
+				}
+				stream.Close()
+			}
+			errs <- err
+		}(i%2 == 0)
+	}
+	for i := 0; i < operations; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("operation error: %v", err)
+		}
+	}
+	if got := fmt.Sprint(parameters.Required); got != "[z a]" {
+		t.Fatalf("caller schema Required mutated to %s", got)
 	}
 }
 

@@ -54,11 +54,12 @@ func (m *chatModel) Generate(ctx context.Context, input []*schema.Message, opts 
 }
 
 func (m *chatModel) generate(ctx context.Context, input []*schema.Message, operation invocationOperation, opts ...model.Option) (*schema.Message, error) {
-	if err := validateInvocationOptions(opts); err != nil {
+	preparedOpts, err := prepareInvocationOptions(opts)
+	if err != nil {
 		return nil, mapInvocationError(operation, err, nil)
 	}
 	opCtx, state := withOperationState(ctx)
-	message, err := m.delegate.Generate(opCtx, input, opts...)
+	message, err := m.delegate.Generate(opCtx, input, preparedOpts...)
 	if err != nil {
 		return nil, mapInvocationError(operation, err, state)
 	}
@@ -72,11 +73,12 @@ func (m *chatModel) generate(ctx context.Context, input []*schema.Message, opera
 }
 
 func (m *chatModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	if err := validateInvocationOptions(opts); err != nil {
+	preparedOpts, err := prepareInvocationOptions(opts)
+	if err != nil {
 		return nil, mapInvocationError(operationStream, err, nil)
 	}
 	opCtx, state := withOperationState(ctx)
-	stream, err := m.delegate.Stream(opCtx, input, opts...)
+	stream, err := m.delegate.Stream(opCtx, input, preparedOpts...)
 	if err != nil {
 		return nil, mapInvocationError(operationStream, err, state)
 	}
@@ -102,13 +104,21 @@ func (m *chatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatMo
 	return &chatModel{delegate: derived, config: m.config}, nil
 }
 
-func validateInvocationOptions(opts []model.Option) error {
+func prepareInvocationOptions(opts []model.Option) ([]model.Option, error) {
 	common := model.GetCommonOptions(nil, opts...)
 	if common.Model != nil && strings.TrimSpace(*common.Model) == "" {
-		return errors.New("opencode-go: model override is required")
+		return nil, errors.New("opencode-go: model override is required")
 	}
 	if common.MaxTokens != nil && *common.MaxTokens <= 0 {
-		return errors.New("opencode-go: max token override must be positive")
+		return nil, errors.New("opencode-go: max token override must be positive")
 	}
-	return nil
+	prepared := append([]model.Option(nil), opts...)
+	if common.Tools != nil {
+		owned, err := cloneTools(common.Tools)
+		if err != nil {
+			return nil, err
+		}
+		prepared = append(prepared, model.WithTools(owned))
+	}
+	return prepared, nil
 }
