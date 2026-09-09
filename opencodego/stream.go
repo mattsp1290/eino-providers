@@ -379,3 +379,58 @@ func normalizeGeneratedUsage(message *schema.Message, state *operationState) err
 	message.ResponseMeta.Usage = observedUsageTokenUsage(observation)
 	return nil
 }
+
+func normalizeObservedStream(source *schema.StreamReader[*schema.Message], state *operationState) *schema.StreamReader[*schema.Message] {
+	reader, writer := schema.Pipe[*schema.Message](1)
+	go func() {
+		defer writer.Close()
+		if source == nil {
+			_ = writer.Send(nil, errMissingSSETerminal)
+			return
+		}
+		defer source.Close()
+		for {
+			message, err := source.Recv()
+			if errors.Is(err, io.EOF) {
+				observation := state.bodySnapshot()
+				if observation.err != nil {
+					_ = writer.Send(nil, observation.err)
+					return
+				}
+				if !observation.terminal {
+					_ = writer.Send(nil, errMissingSSETerminal)
+					return
+				}
+				if usage := observedUsageTokenUsage(observation); usage != nil {
+					_ = writer.Send(&schema.Message{Role: schema.Assistant, ResponseMeta: &schema.ResponseMeta{Usage: usage}}, nil)
+				}
+				return
+			}
+			if err != nil {
+				_ = writer.Send(nil, err)
+				return
+			}
+			if stripped, keep := messageWithoutUsage(message); keep && writer.Send(stripped, nil) {
+				return
+			}
+		}
+	}()
+	return reader
+}
+
+func messageWithoutUsage(message *schema.Message) (*schema.Message, bool) {
+	if message == nil || message.ResponseMeta == nil || message.ResponseMeta.Usage == nil {
+		return message, message != nil
+	}
+	copy := *message
+	meta := *message.ResponseMeta
+	meta.Usage = nil
+	copy.ResponseMeta = &meta
+	if meta.FinishReason == "" && meta.LogProbs == nil && copy.Role == "" && copy.Content == "" &&
+		len(copy.MultiContent) == 0 && len(copy.UserInputMultiContent) == 0 && len(copy.AssistantGenMultiContent) == 0 &&
+		copy.Name == "" && len(copy.ToolCalls) == 0 && copy.ToolCallID == "" && copy.ToolName == "" &&
+		copy.ReasoningContent == "" && len(copy.Extra) == 0 {
+		return nil, false
+	}
+	return &copy, true
+}
