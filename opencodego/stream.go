@@ -390,9 +390,6 @@ func normalizeObservedStream(ctx context.Context, source *schema.StreamReader[*s
 			_ = writer.Send(nil, errMissingSSETerminal)
 			return
 		}
-		if ctx == nil {
-			ctx = context.Background()
-		}
 		var closeSourceOnce sync.Once
 		closeSource := func() { closeSourceOnce.Do(source.Close) }
 		stopCancellation := context.AfterFunc(ctx, closeSource)
