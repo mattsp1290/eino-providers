@@ -68,13 +68,13 @@ func (o *terminalBodyObserver) Read(p []byte) (int, error) {
 		if parseErr != nil {
 			cutoff = i + 1
 			o.pendingErr = parseErr
-			o.closeSource()
+			_ = o.closeSource()
 			break
 		}
 		if terminal {
 			cutoff = i + 1
 			o.terminal.Store(true)
-			o.closeSource()
+			_ = o.closeSource()
 			readErr = nil
 			break
 		}
@@ -83,7 +83,7 @@ func (o *terminalBodyObserver) Read(p []byte) (int, error) {
 	if cutoff > 0 {
 		if cutoff == n && readErr != nil && !o.terminal.Load() && o.pendingErr == nil {
 			o.pendingErr = o.streamReadError(readErr)
-			o.closeSource()
+			_ = o.closeSource()
 		}
 		return cutoff, nil
 	}
@@ -94,7 +94,7 @@ func (o *terminalBodyObserver) Read(p []byte) (int, error) {
 	}
 	if readErr != nil {
 		err := o.streamReadError(readErr)
-		o.closeSource()
+		_ = o.closeSource()
 		return 0, err
 	}
 	return 0, nil
