@@ -18,6 +18,7 @@ const maxObservedJSONBodyBytes = 16 << 20
 var (
 	errMalformedUsage           = errors.New("opencode-go: malformed usage observation")
 	errOversizedJSONObservation = errors.New("opencode-go: response exceeds observation size limit")
+	errAdapterStreamPanic       = errors.New("opencode-go: adapter stream panicked")
 )
 
 type observedBodySource struct {
@@ -386,8 +387,13 @@ func normalizeObservedStream(ctx context.Context, source *schema.StreamReader[*s
 	reader, writer := schema.Pipe[*schema.Message](1)
 	go func() {
 		defer writer.Close()
+		defer func() {
+			if recover() != nil {
+				_ = writer.Send(nil, mapInvocationError(operationReceive, errAdapterStreamPanic, state))
+			}
+		}()
 		if source == nil {
-			_ = writer.Send(nil, errMissingSSETerminal)
+			_ = writer.Send(nil, mapInvocationError(operationReceive, errMissingSSETerminal, state))
 			return
 		}
 		var closeSourceOnce sync.Once
@@ -398,17 +404,17 @@ func normalizeObservedStream(ctx context.Context, source *schema.StreamReader[*s
 		for {
 			message, err := source.Recv()
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				_ = writer.Send(nil, ctxErr)
+				_ = writer.Send(nil, mapInvocationError(operationReceive, ctxErr, state))
 				return
 			}
 			if errors.Is(err, io.EOF) {
 				observation := state.bodySnapshot()
 				if observation.err != nil {
-					_ = writer.Send(nil, observation.err)
+					_ = writer.Send(nil, mapInvocationError(operationReceive, observation.err, state))
 					return
 				}
 				if !observation.terminal {
-					_ = writer.Send(nil, errMissingSSETerminal)
+					_ = writer.Send(nil, mapInvocationError(operationReceive, errMissingSSETerminal, state))
 					return
 				}
 				if usage := observedUsageTokenUsage(observation); usage != nil {
@@ -417,7 +423,7 @@ func normalizeObservedStream(ctx context.Context, source *schema.StreamReader[*s
 				return
 			}
 			if err != nil {
-				_ = writer.Send(nil, err)
+				_ = writer.Send(nil, mapInvocationError(operationReceive, err, state))
 				return
 			}
 			if stripped, keep := messageWithoutUsage(message); keep && writer.Send(stripped, nil) {
