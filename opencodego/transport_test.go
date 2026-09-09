@@ -282,6 +282,38 @@ func TestObservingTransportForwardsCloseIdleConnections(t *testing.T) {
 	}
 }
 
+func TestObservingTransportWrapsOnlySDKEventStreams(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		content string
+		wrapped bool
+	}{
+		{name: "chat stream", path: "/v1/chat/completions", content: "text/event-stream; charset=utf-8", wrapped: true},
+		{name: "messages stream", path: "/v1/messages", content: "text/event-stream", wrapped: true},
+		{name: "responses stream", path: "/v1/responses", content: "text/event-stream"},
+		{name: "chat JSON", path: "/v1/chat/completions", content: "application/json"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := &trackedBody{Reader: strings.NewReader("data: [DONE]\n\n")}
+			base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {tt.content}}, Body: source, Request: req}, nil
+			})
+			req := mustRequest(t, context.Background(), http.MethodPost, "https://api.example.test"+tt.path, http.NoBody)
+			resp, err := (&observingTransport{next: base}).RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, got := resp.Body.(*terminalBodyObserver)
+			if got != tt.wrapped {
+				t.Fatalf("wrapped = %v, want %v", got, tt.wrapped)
+			}
+			_ = resp.Body.Close()
+		})
+	}
+}
+
 type idleClosingTransport struct {
 	closed bool
 }
