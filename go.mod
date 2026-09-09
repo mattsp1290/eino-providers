@@ -9,6 +9,7 @@ require (
 	github.com/cloudwego/eino-ext/components/model/ollama v0.1.9
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/mattsp1290/codex-auth-go v0.1.0
+	github.com/mattsp1290/opencode-auth-go v0.0.0-20260908211055-a3f44cca7a18
 	google.golang.org/genai v1.55.0
 )
 
