@@ -201,16 +201,13 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 		if err := json.Unmarshal(o.eventData, &envelope); err != nil {
 			return false, errMalformedSSE
 		}
+		if o.eventType == "" || envelope.Type == "" || o.eventType != envelope.Type {
+			return false, errMalformedSSE
+		}
 		if err := observeSSEUsage(o.state, o.attempt, o.protocol, o.eventData); err != nil {
 			return false, err
 		}
-		if o.eventType == "message_stop" && envelope.Type != "message_stop" {
-			return false, errMalformedSSE
-		}
-		if envelope.Type == "message_stop" && o.eventType != "message_stop" {
-			return false, errMalformedSSE
-		}
-		if o.eventType == "message_stop" && envelope.Type == "message_stop" {
+		if envelope.Type == "message_stop" {
 			return true, nil
 		}
 	default:

@@ -80,6 +80,8 @@ func TestTerminalBodyObserverFailsIncompleteAndMalformedStreams(t *testing.T) {
 		{name: "reverse mismatched message stop", protocol: terminalMessages, body: "event: message_delta\ndata: {\"type\":\"message_stop\"}\n\n", wantErr: errMalformedSSE},
 		{name: "message stop missing native event", protocol: terminalMessages, body: "data: {\"type\":\"message_stop\"}\n\n", wantErr: errMalformedSSE},
 		{name: "missing message stop payload type", protocol: terminalMessages, body: "event: message_stop\ndata: {}\n\n", wantErr: errMalformedSSE},
+		{name: "message start missing native event", protocol: terminalMessages, body: "data: {\"type\":\"message_start\",\"message\":{}}\n\n", wantErr: errMalformedSSE},
+		{name: "mismatched message delta", protocol: terminalMessages, body: "event: content_block_delta\ndata: {\"type\":\"message_delta\",\"usage\":{}}\n\n", wantErr: errMalformedSSE},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

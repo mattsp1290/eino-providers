@@ -454,6 +454,47 @@ func TestObservedJSONBodyConcurrentCloseUnblocksRead(t *testing.T) {
 	}
 }
 
+func TestTerminalBodyObserverConcurrentCloseUnblocksRead(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		protocol terminalProtocol
+		body     string
+	}{
+		{name: "chat", protocol: terminalChatCompletions, body: "data: {\"choices\":[]}\n\n"},
+		{name: "messages", protocol: terminalMessages, body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := newTerminalThenBlockBody(tt.body)
+			body := newTerminalBodyObserver(source, tt.protocol, &operationState{})
+			buffer := make([]byte, 256)
+			if n, err := body.Read(buffer); n == 0 || err != nil {
+				t.Fatalf("initial Read() = %d, %v", n, err)
+			}
+			done := make(chan error, 1)
+			go func() { _, err := body.Read(buffer); done <- err }()
+			select {
+			case <-source.blocked:
+			case <-time.After(time.Second):
+				t.Fatal("observer did not reach blocked source read")
+			}
+			if err := body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, errMissingSSETerminal) {
+					t.Fatalf("Read() error = %v, want premature terminal error", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Close did not unblock concurrent Read")
+			}
+			if source.closeCount() != 1 {
+				t.Fatalf("close count = %d, want 1", source.closeCount())
+			}
+		})
+	}
+}
+
 func assertTokenUsage(t *testing.T, got, want *schema.TokenUsage) {
 	t.Helper()
 	if got == nil || want == nil {
@@ -470,13 +511,15 @@ func assertTokenUsage(t *testing.T, got, want *schema.TokenUsage) {
 type terminalThenBlockBody struct {
 	data      []byte
 	closed    chan struct{}
+	blocked   chan struct{}
+	blockOnce sync.Once
 	closeOnce sync.Once
 	mu        sync.Mutex
 	closes    int
 }
 
 func newTerminalThenBlockBody(data string) *terminalThenBlockBody {
-	return &terminalThenBlockBody{data: []byte(data), closed: make(chan struct{})}
+	return &terminalThenBlockBody{data: []byte(data), closed: make(chan struct{}), blocked: make(chan struct{})}
 }
 
 func (b *terminalThenBlockBody) Read(p []byte) (int, error) {
@@ -488,6 +531,7 @@ func (b *terminalThenBlockBody) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	b.mu.Unlock()
+	b.blockOnce.Do(func() { close(b.blocked) })
 	<-b.closed
 	return 0, io.EOF
 }
