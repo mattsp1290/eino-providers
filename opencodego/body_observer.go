@@ -30,74 +30,81 @@ const (
 type terminalBodyObserver struct {
 	source    io.ReadCloser
 	protocol  terminalProtocol
+	state     *operationState
+	attempt   uint64
 	closeOnce sync.Once
 	closed    atomic.Bool
 	terminal  atomic.Bool
 
 	line       []byte
 	eventData  []byte
+	eventRaw   []byte
 	eventType  string
 	eventBytes int
+	output     []byte
 	pendingErr error
 }
 
-func newTerminalBodyObserver(source io.ReadCloser, protocol terminalProtocol) io.ReadCloser {
+func newTerminalBodyObserver(source io.ReadCloser, protocol terminalProtocol, states ...*operationState) io.ReadCloser {
 	if source == nil {
 		source = io.NopCloser(bytes.NewReader(nil))
 	}
-	return &terminalBodyObserver{source: source, protocol: protocol}
+	var state *operationState
+	if len(states) > 0 {
+		state = states[0]
+	}
+	return &terminalBodyObserver{source: source, protocol: protocol, state: state, attempt: state.attemptID()}
 }
 
 func (o *terminalBodyObserver) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	if o.pendingErr != nil {
-		err := o.pendingErr
-		o.pendingErr = nil
-		return 0, err
-	}
-	if o.terminal.Load() || o.closed.Load() {
-		return 0, io.EOF
-	}
-
-	n, readErr := o.source.Read(p)
-	cutoff := n
-	for i := 0; i < n; i++ {
-		terminal, parseErr := o.consumeByte(p[i])
-		if parseErr != nil {
-			cutoff = i + 1
-			o.pendingErr = parseErr
-			_ = o.closeSource()
-			break
+	for len(o.output) == 0 && o.pendingErr == nil && !o.terminal.Load() && !o.closed.Load() {
+		buffer := make([]byte, 32<<10)
+		n, readErr := o.source.Read(buffer)
+		for i := 0; i < n; i++ {
+			o.eventRaw = append(o.eventRaw, buffer[i])
+			complete, terminal, parseErr := o.consumeByte(buffer[i])
+			if parseErr != nil {
+				o.pendingErr = parseErr
+				o.recordError(parseErr)
+				o.eventRaw = o.eventRaw[:0]
+				_ = o.closeSource()
+				break
+			}
+			if complete {
+				o.output = append(o.output, o.eventRaw...)
+				o.eventRaw = o.eventRaw[:0]
+			}
+			if terminal {
+				o.terminal.Store(true)
+				o.state.updateBodyForAttempt(o.attempt, func(observation *bodyObservation) { observation.terminal = true })
+				_ = o.closeSource()
+				readErr = nil
+				break
+			}
 		}
-		if terminal {
-			cutoff = i + 1
-			o.terminal.Store(true)
-			_ = o.closeSource()
-			readErr = nil
-			break
-		}
-	}
-
-	if cutoff > 0 {
-		if cutoff == n && readErr != nil && !o.terminal.Load() && o.pendingErr == nil {
+		if readErr != nil && !o.terminal.Load() && o.pendingErr == nil {
 			o.pendingErr = o.streamReadError(readErr)
+			o.recordError(o.pendingErr)
 			_ = o.closeSource()
 		}
-		return cutoff, nil
+		if n == 0 && readErr == nil {
+			return 0, nil
+		}
+	}
+	if len(o.output) > 0 {
+		n := copy(p, o.output)
+		o.output = o.output[n:]
+		return n, nil
 	}
 	if o.pendingErr != nil {
 		err := o.pendingErr
 		o.pendingErr = nil
 		return 0, err
 	}
-	if readErr != nil {
-		err := o.streamReadError(readErr)
-		_ = o.closeSource()
-		return 0, err
-	}
-	return 0, nil
+	return 0, io.EOF
 }
 
 func (o *terminalBodyObserver) Close() error {
@@ -123,14 +130,22 @@ func (o *terminalBodyObserver) streamReadError(err error) error {
 	return err
 }
 
-func (o *terminalBodyObserver) consumeByte(b byte) (bool, error) {
+func (o *terminalBodyObserver) recordError(err error) {
+	o.state.updateBodyForAttempt(o.attempt, func(observation *bodyObservation) {
+		if observation.err == nil {
+			observation.err = err
+		}
+	})
+}
+
+func (o *terminalBodyObserver) consumeByte(b byte) (bool, bool, error) {
 	o.eventBytes++
 	if o.eventBytes > maxObservedSSEEventBytes {
-		return false, errOversizedSSE
+		return false, false, errOversizedSSE
 	}
 	o.line = append(o.line, b)
 	if b != '\n' {
-		return false, nil
+		return false, false, nil
 	}
 
 	line := o.line[:len(o.line)-1]
@@ -143,10 +158,10 @@ func (o *terminalBodyObserver) consumeByte(b byte) (bool, error) {
 		o.eventData = o.eventData[:0]
 		o.eventType = ""
 		o.eventBytes = 0
-		return terminal, err
+		return true, terminal, err
 	}
 	if line[0] == ':' {
-		return false, nil
+		return false, false, nil
 	}
 
 	name, value, found := bytes.Cut(line, []byte{':'})
@@ -164,7 +179,7 @@ func (o *terminalBodyObserver) consumeByte(b byte) (bool, error) {
 		}
 		o.eventData = append(o.eventData, value...)
 	}
-	return false, nil
+	return false, false, nil
 }
 
 func (o *terminalBodyObserver) finishEvent() (bool, error) {
@@ -179,6 +194,9 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 		if len(o.eventData) > 0 && !json.Valid(o.eventData) {
 			return false, errMalformedSSE
 		}
+		if err := observeSSEUsage(o.state, o.attempt, o.protocol, o.eventData); err != nil {
+			return false, err
+		}
 	case terminalMessages:
 		if len(o.eventData) == 0 {
 			if o.eventType == "message_stop" {
@@ -191,6 +209,9 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 		}
 		if err := json.Unmarshal(o.eventData, &envelope); err != nil {
 			return false, errMalformedSSE
+		}
+		if err := observeSSEUsage(o.state, o.attempt, o.protocol, o.eventData); err != nil {
+			return false, err
 		}
 		if o.eventType == "message_stop" && envelope.Type != "message_stop" {
 			return false, errMalformedSSE

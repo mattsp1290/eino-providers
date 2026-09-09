@@ -2,6 +2,8 @@ package opencodego
 
 import (
 	"context"
+	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -59,17 +61,93 @@ func TestOperationStateConcurrentAccess(t *testing.T) {
 	state := &operationState{}
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
-		wg.Add(2)
+		wg.Add(3)
 		go func(status int) {
 			defer wg.Done()
 			state.recordHTTPError(&opencodeauth.HTTPError{StatusCode: status})
 		}(400 + i)
+		go func(value int) {
+			defer wg.Done()
+			state.updateBody(func(observation *bodyObservation) {
+				observation.usage.input = observedCount{value: value, present: true}
+				observation.usage.output = observedCount{value: value, present: true}
+			})
+		}(i)
 		go func() {
 			defer wg.Done()
 			_ = state.httpError()
+			_ = state.bodySnapshot()
 		}()
 	}
 	wg.Wait()
+}
+
+func TestOperationStateBeginAttemptClearsBodyObservation(t *testing.T) {
+	state := &operationState{}
+	state.updateBody(func(observation *bodyObservation) {
+		observation.terminal = true
+		observation.err = errMalformedUsage
+		observation.usage.input = observedCount{value: 3, present: true}
+		observation.usage.output = observedCount{value: 4, present: true}
+	})
+	state.beginAttempt()
+
+	if got := state.bodySnapshot(); got != (bodyObservation{}) {
+		t.Fatalf("body observation survived retry: %#v", got)
+	}
+}
+
+func TestOperationStateRejectsLateUsageFromPriorAttempt(t *testing.T) {
+	state := &operationState{}
+	state.beginAttempt()
+	prior := newObservedJSONBody(
+		io.NopCloser(strings.NewReader(`{"usage":{"prompt_tokens":90,"completion_tokens":90}}`)),
+		terminalChatCompletions,
+		state,
+	)
+
+	state.beginAttempt()
+	current := newObservedJSONBody(
+		io.NopCloser(strings.NewReader(`{"usage":{"prompt_tokens":2,"completion_tokens":3}}`)),
+		terminalChatCompletions,
+		state,
+	)
+	_, _ = io.ReadAll(prior)
+	_ = prior.Close()
+	if got := state.bodySnapshot(); got != (bodyObservation{}) {
+		t.Fatalf("prior attempt repopulated cleared observation: %#v", got)
+	}
+	_, _ = io.ReadAll(current)
+	_ = current.Close()
+	usage := observedUsageTokenUsage(state.bodySnapshot())
+	if usage == nil || usage.PromptTokens != 2 || usage.CompletionTokens != 3 {
+		t.Fatalf("current attempt usage = %#v", usage)
+	}
+}
+
+func TestOperationUsageObservationsStayIsolated(t *testing.T) {
+	const operations = 32
+	states := make([]*operationState, operations)
+	var wg sync.WaitGroup
+	for i := range states {
+		states[i] = &operationState{}
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			states[index].updateBody(func(observation *bodyObservation) {
+				observation.terminal = true
+				observation.usage.input = observedCount{value: index, present: true}
+				observation.usage.output = observedCount{value: index + 1, present: true}
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, state := range states {
+		got := state.bodySnapshot()
+		if got.usage.input.value != i || got.usage.output.value != i+1 || !got.terminal {
+			t.Fatalf("operation %d observation = %#v", i, got)
+		}
+	}
 }
 
 func TestOperationStateNilSafety(t *testing.T) {
@@ -80,7 +158,11 @@ func TestOperationStateNilSafety(t *testing.T) {
 	var nilState *operationState
 	nilState.beginAttempt()
 	nilState.recordHTTPError(nil)
+	nilState.updateBody(nil)
 	if nilState.httpError() != nil {
 		t.Fatal("nil state returned an error")
+	}
+	if got := nilState.bodySnapshot(); got != (bodyObservation{}) {
+		t.Fatalf("nil state body observation = %#v", got)
 	}
 }
