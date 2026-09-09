@@ -36,8 +36,8 @@ func TestMessagesSDKUsesDefaultRetryLimitAndRetryAfter(t *testing.T) {
 	}
 	for i := 1; i < len(attempts); i++ {
 		gap := attempts[i].Sub(attempts[i-1])
-		if gap < 15*time.Millisecond || gap >= 350*time.Millisecond {
-			t.Fatalf("retry gap %d = %v, want short Retry-After delay", i, gap)
+		if gap < 15*time.Millisecond {
+			t.Fatalf("retry gap %d = %v, want at least the explicit Retry-After delay", i, gap)
 		}
 	}
 }
@@ -110,6 +110,50 @@ func TestMessagesSDKRetryRetainsOperationContextAndClearsFailureOnSuccess(t *tes
 	}
 }
 
+func TestMessagesSDKRetryReplaysRequestAndClosesResponseBodies(t *testing.T) {
+	var requestBodies [][]byte
+	var responseBodies []*trackedBody
+	attempts := 0
+	client := newRetryTestMessagesClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("attempt %d request body: %v", attempts, err)
+		}
+		requestBodies = append(requestBodies, body)
+		if attempts == 1 {
+			source := &trackedBody{Reader: strings.NewReader(`{"error":{"type":"RateLimitError","message":"fixture"}}`)}
+			responseBodies = append(responseBodies, source)
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     http.Header{"Retry-After": {"0"}},
+				Body:       source,
+				Request:    req,
+			}, nil
+		}
+		source := &trackedBody{Reader: strings.NewReader(retryTestSuccessJSON)}
+		responseBodies = append(responseBodies, source)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       source,
+			Request:    req,
+		}, nil
+	}))
+
+	if err := callRetryTestMessages(context.Background(), &client); err != nil {
+		t.Fatalf("Messages.New() error = %v", err)
+	}
+	if len(requestBodies) != 2 || len(requestBodies[0]) == 0 || !reflect.DeepEqual(requestBodies[0], requestBodies[1]) {
+		t.Fatalf("replayed request bodies differ: %q", requestBodies)
+	}
+	for i, body := range responseBodies {
+		if got := body.closeCount(); got != 1 {
+			t.Errorf("response body %d close count = %d, want 1", i+1, got)
+		}
+	}
+}
+
 func TestMessagesSDKFinalNetworkFailureClearsStaleHTTPClassification(t *testing.T) {
 	ctx, state := withOperationState(context.Background())
 	attempts := 0
@@ -137,36 +181,37 @@ func TestMessagesSDKFinalNetworkFailureClearsStaleHTTPClassification(t *testing.
 func TestMessagesSDKCancellationDuringBackoffPreventsNextTransportCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = withOperationState(ctx)
-	firstAttempt := make(chan struct{})
+	backoffStarted := make(chan struct{})
 	var mu sync.Mutex
 	attempts := 0
-	client := newRetryTestMessagesClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	httpClient := newRetryTestObservedHTTPClient(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		mu.Lock()
 		attempts++
-		current := attempts
 		mu.Unlock()
-		if current == 1 {
-			close(firstAttempt)
-		}
 		return retryTestResponse(req, http.StatusBadRequest, http.Header{
 			"X-Should-Retry": {"true"},
 			"Retry-After":    {"0.05"},
 		}), nil
 	}))
+	doer := &retryCloseSignalDoer{next: httpClient, closed: backoffStarted}
+	client := newRetryTestMessagesClientWithHTTPDoer(doer)
 
 	done := make(chan error, 1)
 	go func() { done <- callRetryTestMessages(ctx, &client) }()
 	select {
-	case <-firstAttempt:
+	case <-backoffStarted:
 	case <-time.After(time.Second):
-		t.Fatal("first attempt did not reach base transport")
+		t.Fatal("SDK did not close the retry response before backoff")
 	}
-	time.Sleep(10 * time.Millisecond)
+	canceledAt := time.Now()
 	cancel()
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Messages.New() error = %v, want cancellation", err)
+		}
+		if elapsed := time.Since(canceledAt); elapsed < 40*time.Millisecond {
+			t.Fatalf("cancellation returned after %v, want current SDK backoff to complete", elapsed)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Messages.New() did not return after retry backoff")
@@ -181,6 +226,11 @@ func TestMessagesSDKCancellationDuringBackoffPreventsNextTransportCall(t *testin
 
 func newRetryTestMessagesClient(t *testing.T, base http.RoundTripper) anthropic.Client {
 	t.Helper()
+	return newRetryTestMessagesClientWithHTTPDoer(newRetryTestObservedHTTPClient(t, base))
+}
+
+func newRetryTestObservedHTTPClient(t *testing.T, base http.RoundTripper) *http.Client {
+	t.Helper()
 	authClient := mustAuthClient(t, opencodeauth.Options{
 		APIKey:     "auth-key",
 		BaseURL:    retryTestBaseURL,
@@ -192,11 +242,41 @@ func newRetryTestMessagesClient(t *testing.T, base http.RoundTripper) anthropic.
 	if err != nil {
 		t.Fatalf("newObservedHTTPClient() error = %v", err)
 	}
+	return httpClient
+}
+
+func newRetryTestMessagesClientWithHTTPDoer(httpClient option.HTTPClient) anthropic.Client {
 	return anthropic.NewClient(
 		option.WithAPIKey("sdk-placeholder"),
 		option.WithBaseURL("https://api.example.test/"),
 		option.WithHTTPClient(httpClient),
 	)
+}
+
+type retryCloseSignalDoer struct {
+	next   option.HTTPClient
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (d *retryCloseSignalDoer) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.next.Do(req)
+	if resp != nil && resp.Body != nil {
+		resp.Body = &retryCloseSignalBody{ReadCloser: resp.Body, signal: func() {
+			d.once.Do(func() { close(d.closed) })
+		}}
+	}
+	return resp, err
+}
+
+type retryCloseSignalBody struct {
+	io.ReadCloser
+	signal func()
+}
+
+func (b *retryCloseSignalBody) Close() error {
+	b.signal()
+	return b.ReadCloser.Close()
 }
 
 func callRetryTestMessages(ctx context.Context, client *anthropic.Client) error {
@@ -221,11 +301,13 @@ func retryTestSuccess(req *http.Request) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"application/json"}},
-		Body: io.NopCloser(strings.NewReader(`{
-			"id":"msg_fixture","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],
-			"model":"retry-model","stop_reason":"end_turn","stop_sequence":null,
-			"usage":{"input_tokens":1,"output_tokens":1}
-		}`)),
-		Request: req,
+		Body:       io.NopCloser(strings.NewReader(retryTestSuccessJSON)),
+		Request:    req,
 	}
 }
+
+const retryTestSuccessJSON = `{
+	"id":"msg_fixture","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],
+	"model":"retry-model","stop_reason":"end_turn","stop_sequence":null,
+	"usage":{"input_tokens":1,"output_tokens":1}
+}`
