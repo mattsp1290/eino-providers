@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	claudemodel "github.com/cloudwego/eino-ext/components/model/claude"
+	"github.com/cloudwego/eino/schema"
 	opencodeauth "github.com/mattsp1290/opencode-auth-go"
 )
 
@@ -26,10 +26,11 @@ func TestMessagesSDKUsesDefaultRetryLimitAndRetryAfter(t *testing.T) {
 		attempts = append(attempts, time.Now())
 		return retryTestResponse(req, http.StatusTooManyRequests, http.Header{"Retry-After": {"0.02"}}), nil
 	}))
-	doer := &retryResponseHeaderDoer{next: httpClient}
-	client := newRetryTestMessagesClientWithHTTPDoer(doer)
+	doer := &retryResponseHeaderTransport{next: httpClient.Transport}
+	httpClient.Transport = doer
+	client := newRetryTestMessagesClientWithHTTPClient(t, httpClient)
 
-	err := callRetryTestMessages(context.Background(), &client)
+	err := callRetryTestMessages(context.Background(), client)
 	if err == nil {
 		t.Fatal("Messages.New() succeeded after repeated rate limits")
 	}
@@ -69,7 +70,7 @@ func TestMessagesSDKHonorsPermanentAndExplicitRetryPolicy(t *testing.T) {
 				return retryTestResponse(req, status, tt.headers), nil
 			}))
 
-			if err := callRetryTestMessages(context.Background(), &client); err == nil {
+			if err := callRetryTestMessages(context.Background(), client); err == nil {
 				t.Fatal("Messages.New() unexpectedly succeeded")
 			}
 			if attempts != tt.wantAttempts {
@@ -104,7 +105,7 @@ func TestMessagesSDKRetryRetainsOperationContextAndClearsFailureOnSuccess(t *tes
 		return retryTestSuccess(req), nil
 	}))
 
-	if err := callRetryTestMessages(ctx, &client); err != nil {
+	if err := callRetryTestMessages(ctx, client); err != nil {
 		t.Fatalf("Messages.New() error = %v", err)
 	}
 	if attempts != 2 {
@@ -146,7 +147,7 @@ func TestMessagesSDKRetryReplaysRequestAndClosesResponseBodies(t *testing.T) {
 		}, nil
 	}))
 
-	if err := callRetryTestMessages(context.Background(), &client); err != nil {
+	if err := callRetryTestMessages(context.Background(), client); err != nil {
 		t.Fatalf("Messages.New() error = %v", err)
 	}
 	if len(requestBodies) != 2 || len(requestBodies[0]) == 0 || !reflect.DeepEqual(requestBodies[0], requestBodies[1]) {
@@ -171,7 +172,7 @@ func TestMessagesSDKFinalNetworkFailureClearsStaleHTTPClassification(t *testing.
 		return nil, networkErr
 	}))
 
-	err := callRetryTestMessages(ctx, &client)
+	err := callRetryTestMessages(ctx, client)
 	if !errors.Is(err, networkErr) {
 		t.Fatalf("Messages.New() error = %v, want network cause", err)
 	}
@@ -198,11 +199,12 @@ func TestMessagesSDKCancellationDuringBackoffPreventsNextTransportCall(t *testin
 			"Retry-After":    {"0.05"},
 		}), nil
 	}))
-	doer := &retryCloseSignalDoer{next: httpClient, closed: backoffStarted}
-	client := newRetryTestMessagesClientWithHTTPDoer(doer)
+	doer := &retryCloseSignalTransport{next: httpClient.Transport, closed: backoffStarted}
+	httpClient.Transport = doer
+	client := newRetryTestMessagesClientWithHTTPClient(t, httpClient)
 
 	done := make(chan error, 1)
-	go func() { done <- callRetryTestMessages(ctx, &client) }()
+	go func() { done <- callRetryTestMessages(ctx, client) }()
 	select {
 	case <-backoffStarted:
 	case <-time.After(time.Second):
@@ -229,9 +231,9 @@ func TestMessagesSDKCancellationDuringBackoffPreventsNextTransportCall(t *testin
 	}
 }
 
-func newRetryTestMessagesClient(t *testing.T, base http.RoundTripper) anthropic.Client {
+func newRetryTestMessagesClient(t *testing.T, base http.RoundTripper) *claudemodel.ChatModel {
 	t.Helper()
-	return newRetryTestMessagesClientWithHTTPDoer(newRetryTestObservedHTTPClient(t, base))
+	return newRetryTestMessagesClientWithHTTPClient(t, newRetryTestObservedHTTPClient(t, base))
 }
 
 func newRetryTestObservedHTTPClient(t *testing.T, base http.RoundTripper) *http.Client {
@@ -250,35 +252,43 @@ func newRetryTestObservedHTTPClient(t *testing.T, base http.RoundTripper) *http.
 	return httpClient
 }
 
-func newRetryTestMessagesClientWithHTTPDoer(httpClient option.HTTPClient) anthropic.Client {
-	return anthropic.NewClient(
-		option.WithAPIKey("sdk-placeholder"),
-		option.WithBaseURL("https://api.example.test/"),
-		option.WithHTTPClient(httpClient),
-	)
+func newRetryTestMessagesClientWithHTTPClient(t *testing.T, httpClient *http.Client) *claudemodel.ChatModel {
+	t.Helper()
+	baseURL := "https://api.example.test/"
+	client, err := claudemodel.NewChatModel(context.Background(), &claudemodel.Config{
+		APIKey:     "sdk-placeholder",
+		BaseURL:    &baseURL,
+		HTTPClient: httpClient,
+		Model:      "retry-model",
+		MaxTokens:  16,
+	})
+	if err != nil {
+		t.Fatalf("claude.NewChatModel() error = %v", err)
+	}
+	return client
 }
 
-type retryCloseSignalDoer struct {
-	next   option.HTTPClient
+type retryCloseSignalTransport struct {
+	next   http.RoundTripper
 	closed chan struct{}
 	once   sync.Once
 }
 
-type retryResponseHeaderDoer struct {
-	next       option.HTTPClient
+type retryResponseHeaderTransport struct {
+	next       http.RoundTripper
 	retryAfter []string
 }
 
-func (d *retryResponseHeaderDoer) Do(req *http.Request) (*http.Response, error) {
-	resp, err := d.next.Do(req)
+func (d *retryResponseHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := d.next.RoundTrip(req)
 	if resp != nil {
 		d.retryAfter = append(d.retryAfter, resp.Header.Get("Retry-After"))
 	}
 	return resp, err
 }
 
-func (d *retryCloseSignalDoer) Do(req *http.Request) (*http.Response, error) {
-	resp, err := d.next.Do(req)
+func (d *retryCloseSignalTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := d.next.RoundTrip(req)
 	if resp != nil && resp.Body != nil {
 		resp.Body = &retryCloseSignalBody{ReadCloser: resp.Body, signal: func() {
 			d.once.Do(func() { close(d.closed) })
@@ -297,12 +307,8 @@ func (b *retryCloseSignalBody) Close() error {
 	return b.ReadCloser.Close()
 }
 
-func callRetryTestMessages(ctx context.Context, client *anthropic.Client) error {
-	_, err := client.Messages.New(ctx, anthropic.MessageNewParams{
-		MaxTokens: 16,
-		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock("hello"))},
-		Model:     anthropic.Model("retry-model"),
-	})
+func callRetryTestMessages(ctx context.Context, client *claudemodel.ChatModel) error {
+	_, err := client.Generate(ctx, []*schema.Message{schema.UserMessage("hello")})
 	return err
 }
 
