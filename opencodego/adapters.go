@@ -9,7 +9,6 @@ import (
 	openaiadapter "github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/eino-contrib/jsonschema"
 )
 
 // The SDK requires a nonempty key while constructing its client. Requests do
@@ -40,8 +39,8 @@ func cloneTools(tools []*schema.ToolInfo) ([]*schema.ToolInfo, error) {
 			if err != nil {
 				return nil, fmt.Errorf("opencodego: copy tool %q parameters: %w", tool.Name, err)
 			}
-			owned := new(jsonschema.Schema)
-			if err := json.Unmarshal(encoded, owned); err != nil {
+			owned, err := cloneJSON(parameters, encoded)
+			if err != nil {
 				return nil, fmt.Errorf("opencodego: copy tool %q parameters: %w", tool.Name, err)
 			}
 			clone.ParamsOneOf = schema.NewParamsOneOfByJSONSchema(owned)
@@ -49,6 +48,14 @@ func cloneTools(tools []*schema.ToolInfo) ([]*schema.ToolInfo, error) {
 		clones[i] = clone
 	}
 	return clones, nil
+}
+
+func cloneJSON[T any](_ *T, encoded []byte) (*T, error) {
+	owned := new(T)
+	if err := json.Unmarshal(encoded, owned); err != nil {
+		return nil, err
+	}
+	return owned, nil
 }
 
 func newProtocolAdapter(ctx context.Context, cfg preparedConfig) (model.ToolCallingChatModel, error) {

@@ -14,9 +14,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	"github.com/eino-contrib/jsonschema"
 	opencodeauth "github.com/mattsp1290/opencode-auth-go"
-	orderedmap "github.com/wk8/go-ordered-map/v2"
 
 	einoproviders "github.com/mattsp1290/eino-providers"
 )
@@ -178,10 +176,14 @@ func TestChatModelPerCallToolsOwnCallerSchema(t *testing.T) {
 	t.Cleanup(server.Close)
 	cm := newTestChatModel(t, server, "session", nil)
 
-	properties := orderedmap.New[string, *jsonschema.Schema]()
-	properties.Set("z", &jsonschema.Schema{Type: "string"})
-	properties.Set("a", &jsonschema.Schema{Type: "string"})
-	parameters := &jsonschema.Schema{Type: "object", Properties: properties, Required: []string{"z", "a"}}
+	parameters, err := schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"z": {Type: schema.String, Required: true},
+		"a": {Type: schema.String, Required: true},
+	}).ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters.Required = []string{"z", "a"}
 	tools := []*schema.ToolInfo{{Name: "owned", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(parameters)}}
 	option := model.WithTools(tools)
 
