@@ -508,6 +508,12 @@ func assertTokenUsage(t *testing.T, got, want *schema.TokenUsage) {
 	}
 }
 
+func stateWithBodyError(err error) *operationState {
+	state := &operationState{}
+	state.updateBody(func(observation *bodyObservation) { observation.err = err })
+	return state
+}
+
 type terminalThenBlockBody struct {
 	data      []byte
 	closed    chan struct{}
@@ -550,4 +556,158 @@ func (b *terminalThenBlockBody) closeCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.closes
+}
+
+func TestNormalizeObservedStreamReplacesSDKUsageOnce(t *testing.T) {
+	state := &operationState{}
+	state.updateBody(func(observation *bodyObservation) {
+		observation.terminal = true
+		observation.usage = wireUsageObservation{
+			input:  observedCount{value: 3, present: true},
+			output: observedCount{value: 4, present: true},
+		}
+	})
+	source := schema.StreamReaderFromArray([]*schema.Message{
+		{
+			Role:      schema.Assistant,
+			Content:   "hello",
+			ToolCalls: []schema.ToolCall{{ID: "call-1", Type: "function", Function: schema.FunctionCall{Name: "lookup"}}},
+			Extra:     map[string]any{"wire": "preserved"},
+			ResponseMeta: &schema.ResponseMeta{
+				FinishReason: "tool_calls",
+				LogProbs:     &schema.LogProbs{Content: []schema.LogProb{{Token: "hello", LogProb: -0.1}}},
+				Usage:        &schema.TokenUsage{PromptTokens: 99},
+			},
+		},
+		{ResponseMeta: &schema.ResponseMeta{Usage: &schema.TokenUsage{PromptTokens: 99}}},
+	})
+	stream := normalizeObservedStream(context.Background(), source, state)
+	defer stream.Close()
+
+	first, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Content != "hello" || first.ResponseMeta == nil || first.ResponseMeta.Usage != nil ||
+		first.ResponseMeta.FinishReason != "tool_calls" || first.ResponseMeta.LogProbs == nil ||
+		len(first.ToolCalls) != 1 || first.ToolCalls[0].ID != "call-1" || first.Extra["wire"] != "preserved" {
+		t.Fatalf("first chunk = %#v", first)
+	}
+	final, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTokenUsage(t, final.ResponseMeta.Usage, &schema.TokenUsage{PromptTokens: 3, CompletionTokens: 4, TotalTokens: 7})
+	if _, err := stream.Recv(); !errors.Is(err, io.EOF) {
+		t.Fatalf("final Recv() error = %v, want EOF", err)
+	}
+}
+
+func TestNormalizeObservedStreamForwardsReceiveErrorWithoutUsage(t *testing.T) {
+	sentinel := errors.New("source failed")
+	state := &operationState{}
+	state.updateBody(func(observation *bodyObservation) {
+		observation.terminal = true
+		observation.usage = wireUsageObservation{
+			input:  observedCount{value: 3, present: true},
+			output: observedCount{value: 4, present: true},
+		}
+	})
+	source, writer := schema.Pipe[*schema.Message](2)
+	if writer.Send(&schema.Message{Content: "prior"}, nil) {
+		t.Fatal("source closed before first chunk")
+	}
+	if writer.Send(nil, sentinel) {
+		t.Fatal("source closed before error")
+	}
+	writer.Close()
+	stream := normalizeObservedStream(context.Background(), source, state)
+	defer stream.Close()
+
+	message, err := stream.Recv()
+	if err != nil || message.Content != "prior" {
+		t.Fatalf("prior chunk = %#v, %v", message, err)
+	}
+	if message, err = stream.Recv(); message != nil || !errors.Is(err, sentinel) {
+		t.Fatalf("error chunk = %#v, %v", message, err)
+	}
+	if message, err = stream.Recv(); message != nil || !errors.Is(err, io.EOF) {
+		t.Fatalf("post-error chunk = %#v, %v", message, err)
+	}
+}
+
+func TestNormalizeObservedStreamRejectsNilSource(t *testing.T) {
+	stream := normalizeObservedStream(context.Background(), nil, &operationState{})
+	defer stream.Close()
+	if message, err := stream.Recv(); message != nil || !errors.Is(err, errMissingSSETerminal) {
+		t.Fatalf("Recv() = %#v, %v", message, err)
+	}
+}
+
+func TestNormalizeObservedStreamCancellationClosesBlockedSource(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	source, writer := schema.Pipe[*schema.Message](0)
+	upstreamDone := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		writer.Close()
+		close(upstreamDone)
+	}()
+	stream := normalizeObservedStream(ctx, source, &operationState{})
+	done := make(chan error, 1)
+	go func() { _, err := stream.Recv(); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Recv() error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not release blocked source receive")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(time.Second):
+		t.Fatal("upstream producer did not terminate after cancellation")
+	}
+	stream.Close()
+}
+
+func TestNormalizeObservedStreamSkipsNilChunk(t *testing.T) {
+	state := &operationState{}
+	state.updateBody(func(observation *bodyObservation) { observation.terminal = true })
+	source := schema.StreamReaderFromArray([]*schema.Message{nil, {Content: "after nil"}})
+	stream := normalizeObservedStream(context.Background(), source, state)
+	defer stream.Close()
+	message, err := stream.Recv()
+	if err != nil || message.Content != "after nil" {
+		t.Fatalf("Recv() = %#v, %v", message, err)
+	}
+	if message, err = stream.Recv(); message != nil || !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal Recv() = %#v, %v", message, err)
+	}
+}
+
+func TestNormalizeObservedStreamRejectsUnverifiedCompletion(t *testing.T) {
+	tests := []struct {
+		name  string
+		state *operationState
+		want  error
+	}{
+		{name: "missing terminal", state: &operationState{}, want: errMissingSSETerminal},
+		{name: "observer error", state: stateWithBodyError(errMalformedUsage), want: errMalformedUsage},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := normalizeObservedStream(context.Background(), schema.StreamReaderFromArray([]*schema.Message{{Content: "prior"}}), tt.state)
+			defer stream.Close()
+			message, err := stream.Recv()
+			if err != nil || message.Content != "prior" {
+				t.Fatalf("prior chunk = %#v, %v", message, err)
+			}
+			if _, err := stream.Recv(); !errors.Is(err, tt.want) {
+				t.Fatalf("terminal error = %v, want %v", err, tt.want)
+			}
+		})
+	}
 }

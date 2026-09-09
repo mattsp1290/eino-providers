@@ -2,9 +2,11 @@ package opencodego
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strconv"
 	"sync"
 
@@ -378,4 +380,68 @@ func normalizeGeneratedUsage(message *schema.Message, state *operationState) err
 	}
 	message.ResponseMeta.Usage = observedUsageTokenUsage(observation)
 	return nil
+}
+
+func normalizeObservedStream(ctx context.Context, source *schema.StreamReader[*schema.Message], state *operationState) *schema.StreamReader[*schema.Message] {
+	reader, writer := schema.Pipe[*schema.Message](1)
+	go func() {
+		defer writer.Close()
+		if source == nil {
+			_ = writer.Send(nil, errMissingSSETerminal)
+			return
+		}
+		var closeSourceOnce sync.Once
+		closeSource := func() { closeSourceOnce.Do(source.Close) }
+		stopCancellation := context.AfterFunc(ctx, closeSource)
+		defer stopCancellation()
+		defer closeSource()
+		for {
+			message, err := source.Recv()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				_ = writer.Send(nil, ctxErr)
+				return
+			}
+			if errors.Is(err, io.EOF) {
+				observation := state.bodySnapshot()
+				if observation.err != nil {
+					_ = writer.Send(nil, observation.err)
+					return
+				}
+				if !observation.terminal {
+					_ = writer.Send(nil, errMissingSSETerminal)
+					return
+				}
+				if usage := observedUsageTokenUsage(observation); usage != nil {
+					_ = writer.Send(&schema.Message{Role: schema.Assistant, ResponseMeta: &schema.ResponseMeta{Usage: usage}}, nil)
+				}
+				return
+			}
+			if err != nil {
+				_ = writer.Send(nil, err)
+				return
+			}
+			if stripped, keep := messageWithoutUsage(message); keep && writer.Send(stripped, nil) {
+				return
+			}
+		}
+	}()
+	return reader
+}
+
+func messageWithoutUsage(message *schema.Message) (*schema.Message, bool) {
+	if message == nil || message.ResponseMeta == nil || message.ResponseMeta.Usage == nil {
+		return message, message != nil
+	}
+	copy := *message
+	meta := *message.ResponseMeta
+	meta.Usage = nil
+	if meta == (schema.ResponseMeta{}) {
+		copy.ResponseMeta = nil
+	} else {
+		copy.ResponseMeta = &meta
+	}
+	if reflect.DeepEqual(copy, schema.Message{}) {
+		return nil, false
+	}
+	return &copy, true
 }
