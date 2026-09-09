@@ -195,6 +195,9 @@ func (o *terminalBodyObserver) finishEvent() (bool, error) {
 		if o.eventType == "message_stop" && envelope.Type != "message_stop" {
 			return false, errMalformedSSE
 		}
+		if envelope.Type == "message_stop" && o.eventType != "" && o.eventType != "message_stop" {
+			return false, errMalformedSSE
+		}
 		if o.eventType == "message_stop" || envelope.Type == "message_stop" {
 			return true, nil
 		}

@@ -83,6 +83,7 @@ func TestTerminalBodyObserverFailsIncompleteAndMalformedStreams(t *testing.T) {
 		{name: "malformed chat", protocol: terminalChatCompletions, body: "data: {bad}\n\n", wantErr: errMalformedSSE},
 		{name: "spaced chat marker", protocol: terminalChatCompletions, body: "data:   [DONE]\n\n", wantErr: errMalformedSSE},
 		{name: "mismatched message stop", protocol: terminalMessages, body: "event: message_stop\ndata: {\"type\":\"message_delta\"}\n\n", wantErr: errMalformedSSE},
+		{name: "reverse mismatched message stop", protocol: terminalMessages, body: "event: message_delta\ndata: {\"type\":\"message_stop\"}\n\n", wantErr: errMalformedSSE},
 		{name: "missing message stop payload type", protocol: terminalMessages, body: "event: message_stop\ndata: {}\n\n", wantErr: errMalformedSSE},
 	}
 	for _, tt := range tests {
