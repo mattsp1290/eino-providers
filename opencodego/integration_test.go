@@ -251,6 +251,7 @@ func TestIntegrationSessionsAndIdentityAreOperationLocal(t *testing.T) {
 			var calls atomic.Int32
 			var mu sync.Mutex
 			sessions := make(map[string]int)
+			pairs := make(map[string]string)
 			transport := integrationRoundTripper(func(r *http.Request) (*http.Response, error) {
 				calls.Add(1)
 				if r.URL.Path != protocol.path || r.Header.Get("User-Agent") != "integration-host/1" {
@@ -263,8 +264,22 @@ func TestIntegrationSessionsAndIdentityAreOperationLocal(t *testing.T) {
 				} else if r.Header.Get("Authorization") != "Bearer explicit-key" || r.Header.Get("X-Api-Key") != "" {
 					return nil, fmt.Errorf("bearer auth headers were not owned")
 				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					return nil, err
+				}
+				_ = r.Body.Close()
+				value, err := decodeIntegrationRequest(body)
+				if err != nil {
+					return nil, err
+				}
+				prompt := integrationOperationPrompt(value)
+				session := r.Header.Get("X-OpenCode-Session")
 				mu.Lock()
-				sessions[r.Header.Get("X-OpenCode-Session")]++
+				sessions[session]++
+				if prompt != "" {
+					pairs[prompt] = session
+				}
 				mu.Unlock()
 				return integrationHTTPResponse(r, protocol.generateResponse("session answer", "nonzero")), nil
 			})
@@ -306,8 +321,10 @@ func TestIntegrationSessionsAndIdentityAreOperationLocal(t *testing.T) {
 				t.Fatalf("sessions = %#v", sessions)
 			}
 			for i := range operations {
-				if sessions[fmt.Sprintf("operation-%d", i)] != 1 {
-					t.Fatalf("sessions = %#v", sessions)
+				prompt := fmt.Sprintf("prompt-%d", i)
+				session := fmt.Sprintf("operation-%d", i)
+				if sessions[session] != 1 || pairs[prompt] != session {
+					t.Fatalf("sessions/pairs = %#v/%#v", sessions, pairs)
 				}
 			}
 		})
@@ -339,10 +356,8 @@ func captureIntegrationRequest(t *testing.T, protocol integrationProtocol, r *ht
 	if err != nil {
 		t.Errorf("read request: %v", err)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	var value map[string]any
-	if err := decoder.Decode(&value); err != nil {
+	value, err := decodeIntegrationRequest(body)
+	if err != nil {
 		t.Errorf("decode request: %v", err)
 	}
 	return integrationRequest{body: body, value: value, session: r.Header.Get("X-OpenCode-Session")}
@@ -356,17 +371,35 @@ func assertIntegrationPrompt(t *testing.T, protocol integrationProtocol, request
 	if request.value[protocol.capField] != json.Number(fmt.Sprint(cap)) {
 		t.Fatalf("%s = %#v, want %d", protocol.capField, request.value[protocol.capField], cap)
 	}
-	if !integrationJSONContains(request.value, system) || !integrationJSONContains(request.value, user) {
-		t.Fatalf("request missing exact system/user text: %s", request.body)
-	}
-	if protocol.protocol == opencodego.ProtocolResponses {
+	switch protocol.protocol {
+	case opencodego.ProtocolChatCompletions:
+		messages := integrationObjects(t, request.value["messages"])
+		if len(messages) != 2 || messages[0]["role"] != "system" || messages[0]["content"] != system ||
+			messages[1]["role"] != "user" || messages[1]["content"] != user {
+			t.Fatalf("chat prompt = %#v", messages)
+		}
+	case opencodego.ProtocolMessages:
+		systemBlocks := integrationObjects(t, request.value["system"])
+		messages := integrationObjects(t, request.value["messages"])
+		if len(systemBlocks) != 1 || systemBlocks[0]["type"] != "text" || systemBlocks[0]["text"] != system || len(messages) != 1 || messages[0]["role"] != "user" {
+			t.Fatalf("messages prompt = system:%#v messages:%#v", systemBlocks, messages)
+		}
+		userBlocks := integrationObjects(t, messages[0]["content"])
+		if len(userBlocks) != 1 || userBlocks[0]["type"] != "text" || userBlocks[0]["text"] != user {
+			t.Fatalf("messages user content = %#v", userBlocks)
+		}
+	case opencodego.ProtocolResponses:
 		if request.value["instructions"] != system {
 			t.Fatalf("instructions = %#v", request.value["instructions"])
 		}
-		return
-	}
-	if !integrationHasRole(request.value["messages"], "user") {
-		t.Fatalf("request missing user role: %s", request.body)
+		input := integrationObjects(t, request.value["input"])
+		if len(input) != 1 || input[0]["type"] != "message" || input[0]["role"] != "user" {
+			t.Fatalf("responses input = %#v", input)
+		}
+		content := integrationObjects(t, input[0]["content"])
+		if len(content) != 1 || content[0]["type"] != "input_text" || content[0]["text"] != user {
+			t.Fatalf("responses user content = %#v", content)
+		}
 	}
 }
 
@@ -390,25 +423,39 @@ func integrationJSONContains(value any, want string) bool {
 	return false
 }
 
-func integrationHasRole(value any, role string) bool {
-	items, ok := value.([]any)
-	if !ok {
-		return false
-	}
-	for _, item := range items {
-		object, ok := item.(map[string]any)
-		if ok && object["role"] == role {
-			return true
-		}
-	}
-	return false
-}
-
 func assertIntegrationToolReplay(t *testing.T, protocol integrationProtocol, first, second integrationRequest) {
 	t.Helper()
 	tools := integrationObjects(t, first.value["tools"])
-	if len(tools) != 2 || !integrationJSONContains(tools[0], "weather") || !integrationJSONContains(tools[1], "clock") {
+	if len(tools) != 2 {
 		t.Fatalf("tool definitions = %#v", tools)
+	}
+	var weather, clock, parameters map[string]any
+	switch protocol.protocol {
+	case opencodego.ProtocolChatCompletions:
+		if tools[0]["type"] != "function" || tools[1]["type"] != "function" {
+			t.Fatalf("chat tool wrappers = %#v", tools)
+		}
+		weather = integrationObject(t, tools[0]["function"])
+		clock = integrationObject(t, tools[1]["function"])
+		parameters = integrationObject(t, weather["parameters"])
+	case opencodego.ProtocolMessages:
+		weather, clock = tools[0], tools[1]
+		parameters = integrationObject(t, weather["input_schema"])
+	case opencodego.ProtocolResponses:
+		if tools[0]["type"] != "function" || tools[1]["type"] != "function" {
+			t.Fatalf("responses tool wrappers = %#v", tools)
+		}
+		weather, clock = tools[0], tools[1]
+		parameters = integrationObject(t, weather["parameters"])
+	}
+	if weather["name"] != "weather" || weather["description"] != "Get weather" || clock["name"] != "clock" || clock["description"] != "Get time" {
+		t.Fatalf("tool identities = %#v", tools)
+	}
+	properties := integrationObject(t, parameters["properties"])
+	city := integrationObject(t, properties["city"])
+	required, ok := parameters["required"].([]any)
+	if parameters["type"] != "object" || city["type"] != "string" || !ok || len(required) != 1 || required[0] != "city" {
+		t.Fatalf("weather parameter schema = %#v", parameters)
 	}
 	switch protocol.protocol {
 	case opencodego.ProtocolChatCompletions:
@@ -472,6 +519,35 @@ func integrationObjects(t *testing.T, value any) []map[string]any {
 		}
 	}
 	return objects
+}
+
+func integrationObject(t *testing.T, value any) map[string]any {
+	t.Helper()
+	object, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("value is not an object: %#v", value)
+	}
+	return object
+}
+
+func decodeIntegrationRequest(body []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, fmt.Errorf("decode request: %w", err)
+	}
+	return value, nil
+}
+
+func integrationOperationPrompt(value map[string]any) string {
+	for i := range 6 {
+		prompt := fmt.Sprintf("prompt-%d", i)
+		if integrationJSONContains(value, prompt) {
+			return prompt
+		}
+	}
+	return ""
 }
 
 func assertIntegrationUsage(t *testing.T, meta *schema.ResponseMeta, usage string) {
