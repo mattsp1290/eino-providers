@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -423,40 +424,44 @@ func TestIntegrationLifecycleCancellationAndBlockedSendCloseBodies(t *testing.T)
 		t.Run(protocol.name, func(t *testing.T) {
 			for _, mode := range []string{"cancel", "deadline"} {
 				t.Run(mode+" blocked read", func(t *testing.T) {
-					requestDone := make(chan struct{})
-					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						w.Header().Set("Content-Type", "text/event-stream")
-						w.WriteHeader(http.StatusOK)
-						w.(http.Flusher).Flush()
-						<-r.Context().Done()
-						close(requestDone)
-					}))
-					t.Cleanup(server.Close)
-
+					body := newIntegrationBlockingBody()
+					client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+						var responseBody io.ReadCloser = body
+						if protocol.protocol != opencodego.ProtocolResponses {
+							managed := &integrationOnceReadCloser{source: body}
+							responseBody = managed
+							context.AfterFunc(request.Context(), func() { _ = managed.Close() })
+						}
+						return integrationResponse(request, http.StatusOK, "text/event-stream", responseBody, nil), nil
+					})}
 					ctx := context.Background()
 					var cancel context.CancelFunc
 					if mode == "deadline" {
-						ctx, cancel = context.WithTimeout(ctx, 200*time.Millisecond)
+						ctx, cancel = context.WithTimeout(ctx, 100*time.Millisecond)
 					} else {
 						ctx, cancel = context.WithCancel(ctx)
 					}
 					defer cancel()
-					stream, err := newIntegrationChatModel(t, protocol, server.URL+"/v1", server.Client(), "session").Stream(
+					stream, err := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "session").Stream(
 						ctx, []*schema.Message{schema.UserMessage("blocked read")},
 					)
 					if err != nil {
-						if mode != "deadline" || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, einoproviders.ErrProviderTimeout) {
-							t.Fatal(err)
-						}
-						select {
-						case <-requestDone:
-						case <-time.After(time.Second):
-							t.Fatal("deadline did not close the blocked HTTP body")
-						}
-						return
+						t.Fatal(err)
+					}
+					select {
+					case <-body.started:
+					case <-time.After(time.Second):
+						t.Fatal("stream producer did not begin its blocked read")
 					}
 					if mode == "cancel" {
 						cancel()
+					} else {
+						<-ctx.Done()
+					}
+					select {
+					case <-body.closed:
+					case <-time.After(time.Second):
+						t.Fatal("context cancellation did not close the blocked body")
 					}
 					_, recvErr := receiveIntegration(t, stream)
 					stream.Close()
@@ -467,34 +472,37 @@ func TestIntegrationLifecycleCancellationAndBlockedSendCloseBodies(t *testing.T)
 					if !errors.Is(recvErr, want) || (mode == "deadline" && !errors.Is(recvErr, einoproviders.ErrProviderTimeout)) {
 						t.Fatalf("receive error = %v, want %v", recvErr, want)
 					}
-					select {
-					case <-requestDone:
-					case <-time.After(time.Second):
-						t.Fatal("cancellation did not close the blocked HTTP body")
-					}
+					assertIntegrationBlockingBodyClosed(t, body, mode+" blocked read")
 				})
 			}
 
 			t.Run("close blocked send", func(t *testing.T) {
-				body := newIntegrationTrackedBody(protocol.blockedSendStream())
+				body := newIntegrationBlockingStreamBody(protocol.blockedSendStream())
 				release := make(chan struct{})
 				body.readGate = release
 				client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
 					return integrationResponse(request, http.StatusOK, "text/event-stream", body, nil), nil
 				})}
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
 				stream, err := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "session").Stream(
-					ctx, []*schema.Message{schema.UserMessage("blocked send")},
+					context.Background(), []*schema.Message{schema.UserMessage("blocked send")},
 				)
 				if err != nil {
 					t.Fatal(err)
 				}
 				close(release)
-				time.Sleep(20 * time.Millisecond)
-				cancel()
+				select {
+				case <-body.started:
+				case <-time.After(time.Second):
+					t.Fatal("stream producer did not read the blocked-send fixture")
+				}
+				producer := "opencodego.normalizeObservedStream.func1"
+				if protocol.protocol == opencodego.ProtocolResponses {
+					producer = "opencodego.runResponsesStream"
+				}
+				waitIntegrationProducerState(t, producer, true)
 				stream.Close()
-				assertIntegrationBodyClosed(t, body, "blocked send")
+				assertIntegrationBlockingStreamBodyClosed(t, body, "blocked send")
+				waitIntegrationProducerState(t, producer, false)
 			})
 
 			t.Run("natural generate completion", func(t *testing.T) {
@@ -1183,14 +1191,144 @@ func (body *integrationTrackedBody) Read(buffer []byte) (int, error) {
 }
 
 func (body *integrationTrackedBody) Close() error {
+	body.count.Add(1)
 	body.once.Do(func() {
-		body.count.Add(1)
 		if body.onClose != nil {
 			body.onClose()
 		}
 		close(body.closed)
 	})
 	return nil
+}
+
+type integrationBlockingBody struct {
+	started      chan struct{}
+	closed       chan struct{}
+	readDone     chan struct{}
+	startOnce    sync.Once
+	closeOnce    sync.Once
+	readDoneOnce sync.Once
+	count        atomic.Int32
+}
+
+type integrationOnceReadCloser struct {
+	source io.ReadCloser
+	once   sync.Once
+}
+
+func (body *integrationOnceReadCloser) Read(buffer []byte) (int, error) {
+	return body.source.Read(buffer)
+}
+
+func (body *integrationOnceReadCloser) Close() error {
+	var err error
+	body.once.Do(func() { err = body.source.Close() })
+	return err
+}
+
+func newIntegrationBlockingBody() *integrationBlockingBody {
+	return &integrationBlockingBody{started: make(chan struct{}), closed: make(chan struct{}), readDone: make(chan struct{})}
+}
+
+func (body *integrationBlockingBody) Read([]byte) (int, error) {
+	body.startOnce.Do(func() { close(body.started) })
+	<-body.closed
+	body.readDoneOnce.Do(func() { close(body.readDone) })
+	return 0, io.ErrClosedPipe
+}
+
+func (body *integrationBlockingBody) Close() error {
+	body.count.Add(1)
+	body.closeOnce.Do(func() { close(body.closed) })
+	return nil
+}
+
+func assertIntegrationBlockingBodyClosed(t *testing.T, body *integrationBlockingBody, operation string) {
+	t.Helper()
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not close its response body", operation)
+	}
+	select {
+	case <-body.readDone:
+	case <-time.After(time.Second):
+		t.Fatalf("%s left its body reader blocked", operation)
+	}
+	if body.count.Load() != 1 {
+		t.Fatalf("%s body close count = %d, want 1", operation, body.count.Load())
+	}
+}
+
+type integrationBlockingStreamBody struct {
+	reader    io.Reader
+	readGate  <-chan struct{}
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+	count     atomic.Int32
+}
+
+func newIntegrationBlockingStreamBody(payload string) *integrationBlockingStreamBody {
+	return &integrationBlockingStreamBody{reader: strings.NewReader(payload), started: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (body *integrationBlockingStreamBody) Read(buffer []byte) (int, error) {
+	if body.readGate != nil {
+		<-body.readGate
+	}
+	body.startOnce.Do(func() { close(body.started) })
+	if count, err := body.reader.Read(buffer); count > 0 {
+		return count, nil
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		return 0, err
+	}
+	<-body.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (body *integrationBlockingStreamBody) Close() error {
+	body.count.Add(1)
+	body.closeOnce.Do(func() { close(body.closed) })
+	return nil
+}
+
+func assertIntegrationBlockingStreamBodyClosed(t *testing.T, body *integrationBlockingStreamBody, operation string) {
+	t.Helper()
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not close its response body", operation)
+	}
+	if body.count.Load() != 1 {
+		t.Fatalf("%s body close count = %d, want 1", operation, body.count.Load())
+	}
+}
+
+func waitIntegrationProducerState(t *testing.T, producer string, blocked bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		buffer := make([]byte, 1<<20)
+		length := runtime.Stack(buffer, true)
+		found := false
+		for _, stack := range strings.Split(string(buffer[:length]), "\n\n") {
+			if strings.Contains(stack, producer) && strings.Contains(stack, ".send(") {
+				found = true
+				break
+			}
+		}
+		if found == blocked {
+			return
+		}
+		runtime.Gosched()
+	}
+	state := "stop"
+	if blocked {
+		state = "block in writer.Send"
+	}
+	t.Fatalf("stream producer %q did not %s", producer, state)
 }
 
 func assertIntegrationBodyClosed(t *testing.T, body *integrationTrackedBody, operation string) {
