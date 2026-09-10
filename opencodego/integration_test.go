@@ -331,6 +331,394 @@ func TestIntegrationSessionsAndIdentityAreOperationLocal(t *testing.T) {
 	}
 }
 
+func TestIntegrationFailurePreservesClassificationAndReceiveErrors(t *testing.T) {
+	for _, protocol := range integrationProtocols {
+		t.Run(protocol.name, func(t *testing.T) {
+			t.Run("invalid configured session", func(t *testing.T) {
+				var calls atomic.Int32
+				cap := 17
+				chatModel, err := opencodego.NewChatModel(context.Background(), opencodego.ChatModelConfig{
+					Model: "fixture-model", Protocol: protocol.protocol, APIKey: "explicit-key", UserAgent: "integration-host/1",
+					SessionID: "bad session", BaseURL: "https://api.example.test/v1", MaxTokens: &cap,
+					HTTPClient: &http.Client{Transport: integrationRoundTripper(func(*http.Request) (*http.Response, error) {
+						calls.Add(1)
+						return nil, errors.New("unexpected transport call")
+					})},
+				})
+				if chatModel != nil || !errors.Is(err, einoproviders.ErrProviderInit) || !errors.Is(err, opencodeauth.ErrInvalidSessionID) {
+					t.Fatalf("NewChatModel = %#v, %v, want nil init/invalid-session error", chatModel, err)
+				}
+				if calls.Load() != 0 {
+					t.Fatalf("invalid session made %d transport calls", calls.Load())
+				}
+			})
+
+			t.Run("missing session", func(t *testing.T) {
+				var calls atomic.Int32
+				client := &http.Client{Transport: integrationRoundTripper(func(*http.Request) (*http.Response, error) {
+					calls.Add(1)
+					return nil, errors.New("unexpected transport call")
+				})}
+				chatModel := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "")
+				message, err := chatModel.Generate(context.Background(), []*schema.Message{schema.UserMessage("missing")})
+				if message != nil || !errors.Is(err, einoproviders.ErrProviderAPI) || !errors.Is(err, opencodeauth.ErrMissingSessionID) {
+					t.Fatalf("Generate = %#v, %v, want nil ErrProviderAPI", message, err)
+				}
+				if calls.Load() != 0 {
+					t.Fatalf("missing session made %d transport calls", calls.Load())
+				}
+			})
+
+			t.Run("typed HTTP failure", func(t *testing.T) {
+				body := newIntegrationTrackedBody(`{"error":{"type":"authentication_error","message":"secret-upstream-detail"}}`)
+				client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+					return integrationResponse(request, http.StatusUnauthorized, "application/json", body, nil), nil
+				})}
+				message, err := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "session").Generate(
+					context.Background(), []*schema.Message{schema.UserMessage("failure")},
+				)
+				if message != nil || !errors.Is(err, einoproviders.ErrProviderAuth) {
+					t.Fatalf("Generate = %#v, %v, want nil ErrProviderAuth", message, err)
+				}
+				var httpErr *opencodeauth.HTTPError
+				if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusUnauthorized || httpErr.Kind != opencodeauth.ErrorKindAuthentication {
+					t.Fatalf("typed HTTP error = %#v", httpErr)
+				}
+				if strings.Contains(err.Error(), "secret-upstream-detail") {
+					t.Fatalf("public error leaked upstream detail: %v", err)
+				}
+				assertIntegrationBodyClosed(t, body, "HTTP failure")
+			})
+
+			t.Run("receive failure", func(t *testing.T) {
+				release := make(chan struct{})
+				body := newIntegrationTrackedBody(protocol.streamPrefix())
+				body.readGate = release
+				client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+					return integrationResponse(request, http.StatusOK, "text/event-stream", body, nil), nil
+				})}
+				stream, err := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "session").Stream(
+					context.Background(), []*schema.Message{schema.UserMessage("receive")},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				close(release)
+				defer stream.Close()
+				if first := receiveIntegrationChunk(t, stream); first.Content != "early" {
+					t.Fatalf("first content = %q", first.Content)
+				}
+				_, recvErr := receiveIntegration(t, stream)
+				if !errors.Is(recvErr, einoproviders.ErrProviderAPI) || recvErr.Error() != "opencode-go: receive failed" {
+					t.Fatalf("receive error = %v, want safe ErrProviderAPI", recvErr)
+				}
+				assertIntegrationBodyClosed(t, body, "receive failure")
+			})
+		})
+	}
+}
+
+func TestIntegrationLifecycleCancellationAndBlockedSendCloseBodies(t *testing.T) {
+	for _, protocol := range integrationProtocols {
+		t.Run(protocol.name, func(t *testing.T) {
+			for _, mode := range []string{"cancel", "deadline"} {
+				t.Run(mode+" blocked read", func(t *testing.T) {
+					requestDone := make(chan struct{})
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush()
+						<-r.Context().Done()
+						close(requestDone)
+					}))
+					t.Cleanup(server.Close)
+
+					ctx := context.Background()
+					var cancel context.CancelFunc
+					if mode == "deadline" {
+						ctx, cancel = context.WithTimeout(ctx, 200*time.Millisecond)
+					} else {
+						ctx, cancel = context.WithCancel(ctx)
+					}
+					defer cancel()
+					stream, err := newIntegrationChatModel(t, protocol, server.URL+"/v1", server.Client(), "session").Stream(
+						ctx, []*schema.Message{schema.UserMessage("blocked read")},
+					)
+					if err != nil {
+						if mode != "deadline" || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, einoproviders.ErrProviderTimeout) {
+							t.Fatal(err)
+						}
+						select {
+						case <-requestDone:
+						case <-time.After(time.Second):
+							t.Fatal("deadline did not close the blocked HTTP body")
+						}
+						return
+					}
+					if mode == "cancel" {
+						cancel()
+					}
+					_, recvErr := receiveIntegration(t, stream)
+					stream.Close()
+					want := context.Canceled
+					if mode == "deadline" {
+						want = context.DeadlineExceeded
+					}
+					if !errors.Is(recvErr, want) || (mode == "deadline" && !errors.Is(recvErr, einoproviders.ErrProviderTimeout)) {
+						t.Fatalf("receive error = %v, want %v", recvErr, want)
+					}
+					select {
+					case <-requestDone:
+					case <-time.After(time.Second):
+						t.Fatal("cancellation did not close the blocked HTTP body")
+					}
+				})
+			}
+
+			t.Run("close blocked send", func(t *testing.T) {
+				body := newIntegrationTrackedBody(protocol.blockedSendStream())
+				release := make(chan struct{})
+				body.readGate = release
+				client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+					return integrationResponse(request, http.StatusOK, "text/event-stream", body, nil), nil
+				})}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				stream, err := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "session").Stream(
+					ctx, []*schema.Message{schema.UserMessage("blocked send")},
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				close(release)
+				time.Sleep(20 * time.Millisecond)
+				cancel()
+				stream.Close()
+				assertIntegrationBodyClosed(t, body, "blocked send")
+			})
+
+			t.Run("natural generate completion", func(t *testing.T) {
+				body := newIntegrationTrackedBody(protocol.generateResponse("closed", "nonzero"))
+				client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+					return integrationResponse(request, http.StatusOK, "application/json", body, nil), nil
+				})}
+				message, err := newIntegrationChatModel(t, protocol, "https://api.example.test/v1", client, "session").Generate(
+					context.Background(), []*schema.Message{schema.UserMessage("close")},
+				)
+				if err != nil || message == nil || message.Content != "closed" {
+					t.Fatalf("Generate = %#v, %v", message, err)
+				}
+				assertIntegrationBodyClosed(t, body, "successful generation")
+			})
+		})
+	}
+}
+
+func TestIntegrationRedirectAndRouteBoundaries(t *testing.T) {
+	for _, protocol := range integrationProtocols {
+		t.Run(protocol.name, func(t *testing.T) {
+			t.Run("redirect target receives nothing", func(t *testing.T) {
+				var targetCalls atomic.Int32
+				target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					targetCalls.Add(1)
+				}))
+				t.Cleanup(target.Close)
+				var sourceCalls atomic.Int32
+				source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					sourceCalls.Add(1)
+					if r.URL.Path != protocol.path {
+						t.Errorf("source path = %q, want %q", r.URL.Path, protocol.path)
+					}
+					http.Redirect(w, r, target.URL+"/credential-sink", http.StatusTemporaryRedirect)
+				}))
+				t.Cleanup(source.Close)
+				_, _ = newIntegrationChatModel(t, protocol, source.URL+"/v1", source.Client(), "session").Generate(
+					context.Background(), []*schema.Message{schema.UserMessage("redirect")},
+				)
+				if sourceCalls.Load() != 1 || targetCalls.Load() != 0 {
+					t.Fatalf("redirect calls source/target = %d/%d", sourceCalls.Load(), targetCalls.Load())
+				}
+			})
+
+			t.Run("custom root exact route", func(t *testing.T) {
+				const root = "/custom/v1/custom"
+				wantPath := root + strings.TrimPrefix(protocol.path, "/v1")
+				var calls atomic.Int32
+				client := &http.Client{Transport: integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+					calls.Add(1)
+					if request.URL.Scheme != "https" || request.URL.Host != "api.example.test" || request.URL.Path != wantPath {
+						return nil, fmt.Errorf("request URL = %s, want https://api.example.test%s", request.URL, wantPath)
+					}
+					if protocol.protocol == opencodego.ProtocolMessages && (request.Header.Get("X-Api-Key") != "explicit-key" || request.Header.Get("X-OpenCode-Session") != "session") {
+						return nil, fmt.Errorf("messages route was not authenticated after mapping")
+					}
+					return integrationHTTPResponse(request, protocol.generateResponse("routed", "omitted")), nil
+				})}
+				message, err := newIntegrationChatModel(t, protocol, "https://api.example.test"+root, client, "session").Generate(
+					context.Background(), []*schema.Message{schema.UserMessage("route")},
+				)
+				if err != nil || message == nil || message.Content != "routed" || calls.Load() != 1 {
+					t.Fatalf("Generate/calls = %#v, %v, %d", message, err, calls.Load())
+				}
+			})
+		})
+	}
+}
+
+func TestIntegrationRetryMessagesPolicyAndTiming(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var attempts atomic.Int32
+			chatModel := newIntegrationMessagesModel(t, integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return integrationRetryResponse(request, status, nil, nil), nil
+			}))
+			if _, err := chatModel.Generate(context.Background(), []*schema.Message{schema.UserMessage("permanent")}); err == nil {
+				t.Fatal("permanent failure unexpectedly succeeded")
+			}
+			if attempts.Load() != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts.Load())
+			}
+		})
+	}
+
+	t.Run("default retry limit preserves Retry-After", func(t *testing.T) {
+		var mu sync.Mutex
+		var attempts []time.Time
+		var retryCounts []string
+		var sessions []string
+		var requestBodies [][]byte
+		var responseBodies []*integrationTrackedBody
+		chatModel := newIntegrationMessagesModel(t, integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+			requestBody, err := io.ReadAll(request.Body)
+			if err != nil {
+				return nil, err
+			}
+			responseBody := newIntegrationTrackedBody(`{"error":{"type":"rate_limit_error","message":"fixture"}}`)
+			mu.Lock()
+			attempts = append(attempts, time.Now())
+			retryCounts = append(retryCounts, request.Header.Get("X-Stainless-Retry-Count"))
+			sessions = append(sessions, request.Header.Get("X-OpenCode-Session"))
+			requestBodies = append(requestBodies, requestBody)
+			responseBodies = append(responseBodies, responseBody)
+			mu.Unlock()
+			return integrationRetryResponse(request, http.StatusTooManyRequests, http.Header{"Retry-After": {"0.02"}}, responseBody), nil
+		}))
+		_, err := chatModel.Generate(context.Background(), []*schema.Message{schema.UserMessage("retry")})
+		if err == nil {
+			t.Fatal("repeated rate limit unexpectedly succeeded")
+		}
+		if len(attempts) != 3 || strings.Join(retryCounts, ",") != "0,1,2" {
+			t.Fatalf("attempts/retry counts = %d/%v", len(attempts), retryCounts)
+		}
+		for i := 1; i < len(attempts); i++ {
+			if gap := attempts[i].Sub(attempts[i-1]); gap < 15*time.Millisecond {
+				t.Fatalf("retry gap %d = %v, want preserved Retry-After", i, gap)
+			}
+		}
+		for i := range requestBodies {
+			if sessions[i] != "session" || len(requestBodies[i]) == 0 || !bytes.Equal(requestBodies[0], requestBodies[i]) {
+				t.Fatalf("attempt %d session/body = %q/%q", i+1, sessions[i], requestBodies[i])
+			}
+			assertIntegrationBodyClosed(t, responseBodies[i], fmt.Sprintf("retry response %d", i+1))
+		}
+	})
+
+	for _, tt := range []struct {
+		name         string
+		status       int
+		headers      http.Header
+		wantAttempts int32
+	}{
+		{name: "explicit retry overrides permanent status", status: http.StatusBadRequest, headers: http.Header{"X-Should-Retry": {"true"}, "Retry-After": {"0"}}, wantAttempts: 3},
+		{name: "explicit no retry overrides retryable status", status: http.StatusInternalServerError, headers: http.Header{"X-Should-Retry": {"false"}}, wantAttempts: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			chatModel := newIntegrationMessagesModel(t, integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+				attempts.Add(1)
+				return integrationRetryResponse(request, tt.status, tt.headers, nil), nil
+			}))
+			if _, err := chatModel.Generate(context.Background(), []*schema.Message{schema.UserMessage("directive")}); err == nil {
+				t.Fatal("directed failure unexpectedly succeeded")
+			}
+			if attempts.Load() != tt.wantAttempts {
+				t.Fatalf("attempts = %d, want %d", attempts.Load(), tt.wantAttempts)
+			}
+		})
+	}
+
+	t.Run("cancellation waits for current SDK sleep and prevents another call", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		closed := make(chan struct{})
+		var attempts atomic.Int32
+		chatModel := newIntegrationMessagesModel(t, integrationRoundTripper(func(request *http.Request) (*http.Response, error) {
+			attempts.Add(1)
+			body := newIntegrationTrackedBody(`{"error":{"type":"api_error","message":"fixture"}}`)
+			body.onClose = func() { close(closed) }
+			return integrationRetryResponse(request, http.StatusBadRequest, http.Header{
+				"X-Should-Retry": {"true"},
+				"Retry-After":    {"0.05"},
+			}, body), nil
+		}))
+		done := make(chan error, 1)
+		go func() {
+			_, err := chatModel.Generate(ctx, []*schema.Message{schema.UserMessage("cancel backoff")})
+			done <- err
+		}()
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("retry response was not closed before backoff")
+		}
+		canceledAt := time.Now()
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Generate error = %v, want context.Canceled", err)
+			}
+			// The pinned SDK uses time.Sleep. Cancellation prevents another
+			// request but returns only after the current short backoff ends.
+			if elapsed := time.Since(canceledAt); elapsed < 40*time.Millisecond {
+				t.Fatalf("cancellation returned after %v, before current SDK sleep ended", elapsed)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Generate did not return after retry backoff")
+		}
+		if attempts.Load() != 1 {
+			t.Fatalf("transport attempts after cancellation = %d, want 1", attempts.Load())
+		}
+	})
+
+	t.Run("immediate transport failures retain SDK backoff", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		networkErr := errors.New("fixture network failure")
+		var mu sync.Mutex
+		var attempts []time.Time
+		chatModel := newIntegrationMessagesModel(t, integrationRoundTripper(func(*http.Request) (*http.Response, error) {
+			mu.Lock()
+			attempts = append(attempts, time.Now())
+			mu.Unlock()
+			return nil, networkErr
+		}))
+		_, err := chatModel.Generate(ctx, []*schema.Message{schema.UserMessage("network retry")})
+		if !errors.Is(err, networkErr) {
+			t.Fatalf("Generate error = %v, want network cause", err)
+		}
+		if len(attempts) != 3 {
+			t.Fatalf("transport attempts = %d, want 3", len(attempts))
+		}
+		for i := 1; i < len(attempts); i++ {
+			if gap := attempts[i].Sub(attempts[i-1]); gap < 300*time.Millisecond {
+				t.Fatalf("immediate failure retry gap %d = %v, want SDK backoff", i, gap)
+			}
+		}
+	})
+}
+
 type integrationRequest struct {
 	body    []byte
 	value   map[string]any
@@ -708,6 +1096,26 @@ func (p integrationProtocol) streamTerminal() string {
 	}
 }
 
+func (p integrationProtocol) blockedSendStream() string {
+	const chunks = 64
+	switch p.protocol {
+	case opencodego.ProtocolChatCompletions:
+		return strings.Repeat("data: {\"id\":\"blocked\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"fixture-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n", chunks)
+	case opencodego.ProtocolMessages:
+		return strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"blocked","type":"message","role":"assistant","content":[],"model":"fixture-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}`,
+			"",
+			`event: content_block_start`,
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			"",
+		}, "\n") + strings.Repeat("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n", chunks)
+	default:
+		return "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+			strings.Repeat("data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"x\"}\n\n", chunks)
+	}
+}
+
 func receiveIntegrationChunk(t *testing.T, stream *schema.StreamReader[*schema.Message]) *schema.Message {
 	t.Helper()
 	message, err := receiveIntegration(t, stream)
@@ -752,6 +1160,72 @@ func integrationHTTPResponse(request *http.Request, body string) *http.Response 
 		Body:       io.NopCloser(strings.NewReader(body)),
 		Request:    request,
 	}
+}
+
+type integrationTrackedBody struct {
+	reader   io.Reader
+	readGate <-chan struct{}
+	closed   chan struct{}
+	onClose  func()
+	once     sync.Once
+	count    atomic.Int32
+}
+
+func newIntegrationTrackedBody(body string) *integrationTrackedBody {
+	return &integrationTrackedBody{reader: strings.NewReader(body), closed: make(chan struct{})}
+}
+
+func (body *integrationTrackedBody) Read(buffer []byte) (int, error) {
+	if body.readGate != nil {
+		<-body.readGate
+	}
+	return body.reader.Read(buffer)
+}
+
+func (body *integrationTrackedBody) Close() error {
+	body.once.Do(func() {
+		body.count.Add(1)
+		if body.onClose != nil {
+			body.onClose()
+		}
+		close(body.closed)
+	})
+	return nil
+}
+
+func assertIntegrationBodyClosed(t *testing.T, body *integrationTrackedBody, operation string) {
+	t.Helper()
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not close its response body", operation)
+	}
+	if body.count.Load() != 1 {
+		t.Fatalf("%s body close count = %d, want 1", operation, body.count.Load())
+	}
+}
+
+func integrationResponse(request *http.Request, status int, contentType string, body io.ReadCloser, headers http.Header) *http.Response {
+	responseHeaders := headers.Clone()
+	if responseHeaders == nil {
+		responseHeaders = make(http.Header)
+	}
+	if contentType != "" {
+		responseHeaders.Set("Content-Type", contentType)
+	}
+	return &http.Response{StatusCode: status, Header: responseHeaders, Body: body, Request: request}
+}
+
+func newIntegrationMessagesModel(t *testing.T, transport http.RoundTripper) model.ToolCallingChatModel {
+	t.Helper()
+	return newIntegrationChatModel(t, integrationProtocols[1], "https://api.example.test/v1", &http.Client{Transport: transport}, "session")
+}
+
+func integrationRetryResponse(request *http.Request, status int, headers http.Header, body io.ReadCloser) *http.Response {
+	if body == nil {
+		body = newIntegrationTrackedBody(`{"error":{"type":"api_error","message":"fixture"}}`)
+	}
+	return integrationResponse(request, status, "application/json", body, headers)
 }
 
 func quoted(value string) string {
