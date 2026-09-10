@@ -15,7 +15,7 @@ import (
 
 func TestResponsesStreamAssemblesTextReasoningAndParallelTools(t *testing.T) {
 	body := responsesSSE(
-		`{"type":"future.event","value":1}`,
+		`{"type":"future.event","output_index":"opaque","delta":{"future":true},"arguments":[]}`,
 		`{"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}`,
 		`{"type":"response.reasoning_text.delta","output_index":0,"delta":"think"}`,
 		`{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"opaque","summary":[]}}`,
@@ -57,6 +57,7 @@ func TestResponsesStreamSupportsCRLFMultilineAndTerminalReconciliation(t *testin
 	body := ": heartbeat\r\n\r\n" + responsesSSE(
 		`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
 		`{"type":"response.output_text.delta","output_index":0,"delta":"hel"}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}`,
 		`{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","status":"completed","name":"tool","arguments":"{\"x\":1}","call_id":"call"}}`,
 	)
 	body = strings.ReplaceAll(body, "\n", "\r\n") + "data: " + terminal[:cut+1] + "\r\ndata: " + terminal[cut+1:] + "\r\n\r\n"
@@ -80,14 +81,18 @@ func TestResponsesStreamRejectsMalformedAndIncompleteEvents(t *testing.T) {
 		{name: "duplicate output", body: responsesSSE(`{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}`, `{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}`), want: errInvalidResponsesEvent},
 		{name: "mismatched call", body: responsesSSE(`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"a","arguments":"","call_id":"call"}}`, `{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"b","arguments":"{}","call_id":"call"}}`), want: errInvalidResponsesEvent},
 		{name: "argument disagreement", body: responsesSSE(`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"a","arguments":"","call_id":"call"}}`, `{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{}"}`, `{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"x\":1}"}`), want: errInvalidResponsesEvent},
+		{name: "duplicate call id", body: responsesSSE(`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","name":"a","arguments":"{}","call_id":"call"}}`, `{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","name":"b","arguments":"{}","call_id":"call"}}`), want: errInvalidResponsesEvent},
+		{name: "duplicate item id", body: responsesSSE(`{"type":"response.output_item.added","output_index":0,"item":{"id":"item","type":"message","role":"assistant","content":[]}}`, `{"type":"response.output_item.added","output_index":1,"item":{"id":"item","type":"message","role":"assistant","content":[]}}`), want: errInvalidResponsesEvent},
 		{name: "failed", body: responsesSSE(`{"type":"response.failed","response":{"error":{"message":"secret"}}}`), want: einoproviders.ErrProviderAPI},
 		{name: "incomplete", body: responsesSSE(`{"type":"response.incomplete","response":{}}`), want: einoproviders.ErrProviderAPI},
 		{name: "native error", body: responsesSSE(`{"type":"error","message":"secret"}`), want: einoproviders.ErrProviderAPI},
 		{name: "done only", body: responsesSSE(`[DONE]`), want: errResponsesStreamEnded},
 		{name: "premature eof", body: "", want: errResponsesStreamEnded},
+		{name: "unterminated terminal", body: `data: {"type":"response.completed","response":{"status":"completed","output":[]}}`, want: errResponsesStreamEnded},
 		{name: "bad terminal status", body: responsesSSE(`{"type":"response.completed","response":{"status":"failed","output":[]}}`), want: einoproviders.ErrProviderAPI},
 		{name: "missing terminal output", body: responsesSSE(`{"type":"response.completed","response":{"status":"completed"}}`), want: einoproviders.ErrProviderAPI},
 		{name: "terminal text mismatch", body: responsesSSE(`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`, `{"type":"response.output_text.delta","output_index":0,"delta":"a"}`, `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}]}]}}`), want: einoproviders.ErrProviderAPI},
+		{name: "done and terminal text mismatch", body: responsesSSE(`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}}`, `{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}]}}`), want: einoproviders.ErrProviderAPI},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -104,7 +109,8 @@ func TestResponsesStreamRejectsMalformedAndIncompleteEvents(t *testing.T) {
 
 func TestResponsesStreamBoundsSingleAndMultilineEvents(t *testing.T) {
 	prefix := `{"type":"future.event"}`
-	exactPayload := prefix + strings.Repeat(" ", maxResponsesEventBytes-len(prefix))
+	wireOverhead := len("data: ") + len("\n")
+	exactPayload := prefix + strings.Repeat(" ", maxResponsesEventBytes-len(prefix)-wireOverhead)
 	_, _, err := parseResponsesForTest("data: " + exactPayload + "\n\n")
 	if !errors.Is(err, errResponsesStreamEnded) {
 		t.Fatalf("exact limit error = %v", err)
@@ -119,6 +125,11 @@ func TestResponsesStreamBoundsSingleAndMultilineEvents(t *testing.T) {
 	_, _, err = parseResponsesForTest(multiline)
 	if !errors.Is(err, errResponsesEventTooLarge) {
 		t.Fatalf("multiline aggregate error = %v", err)
+	}
+	ignored := "event: " + strings.Repeat("x", maxResponsesEventBytes/2) + "\n"
+	_, _, err = parseResponsesForTest(ignored + ignored + "\n")
+	if !errors.Is(err, errResponsesEventTooLarge) {
+		t.Fatalf("non-data aggregate error = %v", err)
 	}
 }
 

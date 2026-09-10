@@ -41,9 +41,9 @@ const (
 
 type responsesStreamEvent struct {
 	Type        string          `json:"type"`
-	OutputIndex *int            `json:"output_index"`
-	Delta       *string         `json:"delta"`
-	Arguments   *string         `json:"arguments"`
+	OutputIndex json.RawMessage `json:"output_index"`
+	Delta       json.RawMessage `json:"delta"`
+	Arguments   json.RawMessage `json:"arguments"`
 	Item        json.RawMessage `json:"item"`
 	Response    json.RawMessage `json:"response"`
 }
@@ -61,7 +61,6 @@ type responsesStreamOutputItem struct {
 
 type responsesStreamCall struct {
 	index     int
-	itemID    string
 	name      string
 	callID    string
 	arguments strings.Builder
@@ -72,6 +71,9 @@ type responsesStreamCall struct {
 
 type responsesStreamState struct {
 	calls       map[int]*responsesStreamCall
+	callIDs     map[string]int
+	outputIDs   map[int]string
+	itemIDs     map[string]int
 	reasoning   map[int]json.RawMessage
 	outputs     map[int]string
 	finished    map[int]bool
@@ -83,7 +85,8 @@ type responsesStreamState struct {
 
 func newResponsesStreamState() *responsesStreamState {
 	return &responsesStreamState{
-		calls: make(map[int]*responsesStreamCall), reasoning: make(map[int]json.RawMessage),
+		calls: make(map[int]*responsesStreamCall), callIDs: make(map[string]int),
+		outputIDs: make(map[int]string), itemIDs: make(map[string]int), reasoning: make(map[int]json.RawMessage),
 		outputs: make(map[int]string), finished: make(map[int]bool), text: make(map[int]*strings.Builder),
 	}
 }
@@ -93,16 +96,11 @@ func parseResponsesStream(ctx context.Context, body io.Reader, send func(*schema
 	state := newResponsesStreamState()
 	var data bytes.Buffer
 	dataLines := 0
+	eventBytes := 0
 	for {
 		line, err := readResponsesSSELine(reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				if dataLines > 0 {
-					terminal, dispatchErr := dispatchResponsesEvent(data.Bytes(), state, send)
-					if dispatchErr != nil || terminal != nil {
-						return terminal, dispatchErr
-					}
-				}
 				return nil, errResponsesStreamEnded
 			}
 			return nil, err
@@ -112,16 +110,22 @@ func parseResponsesStream(ctx context.Context, body io.Reader, send func(*schema
 		}
 		if len(line) == 0 {
 			if dataLines == 0 {
+				eventBytes = 0
 				continue
 			}
 			terminal, dispatchErr := dispatchResponsesEvent(data.Bytes(), state, send)
 			data.Reset()
 			dataLines = 0
+			eventBytes = 0
 			if dispatchErr != nil || terminal != nil {
 				return terminal, dispatchErr
 			}
 			continue
 		}
+		if eventBytes > maxResponsesEventBytes-len(line)-1 {
+			return nil, errResponsesEventTooLarge
+		}
+		eventBytes += len(line) + 1
 		if line[0] == ':' {
 			continue
 		}
@@ -178,55 +182,65 @@ func dispatchResponsesEvent(data []byte, state *responsesStreamState, send func(
 	}
 	switch event.Type {
 	case responsesEventOutputTextDelta:
-		if event.OutputIndex == nil || event.Delta == nil {
+		outputIndex, indexOK := decodeResponsesEventField[int](event.OutputIndex)
+		delta, deltaOK := decodeResponsesEventField[string](event.Delta)
+		if !indexOK || !deltaOK {
 			return nil, errInvalidResponsesEvent
 		}
-		if state.outputs[*event.OutputIndex] != "message" || state.finished[*event.OutputIndex] {
+		if state.outputs[outputIndex] != "message" || state.finished[outputIndex] {
 			return nil, errInvalidResponsesEvent
 		}
-		if !state.retain(len(*event.Delta)) {
+		if !state.retain(len(delta)) {
 			return nil, errResponsesEventTooLarge
 		}
-		state.text[*event.OutputIndex].WriteString(*event.Delta)
-		if *event.Delta != "" && send(&schema.Message{Role: schema.Assistant, Content: *event.Delta}) {
+		state.text[outputIndex].WriteString(delta)
+		if delta != "" && send(&schema.Message{Role: schema.Assistant, Content: delta}) {
 			return nil, errResponsesConsumerGone
 		}
 	case responsesEventReasoningTextDelta, responsesEventReasoningSummaryDelta:
-		if event.OutputIndex == nil || event.Delta == nil {
+		outputIndex, indexOK := decodeResponsesEventField[int](event.OutputIndex)
+		delta, deltaOK := decodeResponsesEventField[string](event.Delta)
+		if !indexOK || !deltaOK {
 			return nil, errInvalidResponsesEvent
 		}
-		if state.outputs[*event.OutputIndex] != "reasoning" || state.finished[*event.OutputIndex] {
+		if state.outputs[outputIndex] != "reasoning" || state.finished[outputIndex] {
 			return nil, errInvalidResponsesEvent
 		}
-		if *event.Delta != "" && send(&schema.Message{Role: schema.Assistant, ReasoningContent: *event.Delta}) {
+		if delta != "" && send(&schema.Message{Role: schema.Assistant, ReasoningContent: delta}) {
 			return nil, errResponsesConsumerGone
 		}
 	case responsesEventOutputItemAdded:
-		if event.OutputIndex == nil || len(event.Item) == 0 {
+		outputIndex, ok := decodeResponsesEventField[int](event.OutputIndex)
+		if !ok || len(event.Item) == 0 {
 			return nil, errInvalidResponsesEvent
 		}
-		if err := state.addItem(*event.OutputIndex, event.Item, send); err != nil {
+		if err := state.addItem(outputIndex, event.Item, send); err != nil {
 			return nil, err
 		}
 	case responsesEventFunctionArgsDelta:
-		if event.OutputIndex == nil || event.Delta == nil {
+		outputIndex, indexOK := decodeResponsesEventField[int](event.OutputIndex)
+		delta, deltaOK := decodeResponsesEventField[string](event.Delta)
+		if !indexOK || !deltaOK {
 			return nil, errInvalidResponsesEvent
 		}
-		if err := state.addArguments(*event.OutputIndex, *event.Delta, send); err != nil {
+		if err := state.addArguments(outputIndex, delta, send); err != nil {
 			return nil, err
 		}
 	case responsesEventFunctionArgsDone:
-		if event.OutputIndex == nil || event.Arguments == nil {
+		outputIndex, indexOK := decodeResponsesEventField[int](event.OutputIndex)
+		arguments, argumentsOK := decodeResponsesEventField[string](event.Arguments)
+		if !indexOK || !argumentsOK {
 			return nil, errInvalidResponsesEvent
 		}
-		if err := state.finishArguments(*event.OutputIndex, *event.Arguments); err != nil {
+		if err := state.finishArguments(outputIndex, arguments); err != nil {
 			return nil, err
 		}
 	case responsesEventOutputItemDone:
-		if event.OutputIndex == nil || len(event.Item) == 0 {
+		outputIndex, ok := decodeResponsesEventField[int](event.OutputIndex)
+		if !ok || len(event.Item) == 0 {
 			return nil, errInvalidResponsesEvent
 		}
-		if err := state.finishItem(*event.OutputIndex, event.Item, send); err != nil {
+		if err := state.finishItem(outputIndex, event.Item, send); err != nil {
 			return nil, err
 		}
 	case responsesEventCompleted:
@@ -242,6 +256,14 @@ func dispatchResponsesEvent(data []byte, state *responsesStreamState, send func(
 	return nil, nil
 }
 
+func decodeResponsesEventField[T any](raw json.RawMessage) (T, bool) {
+	var value T
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &value) != nil {
+		return value, false
+	}
+	return value, true
+}
+
 func (state *responsesStreamState) addItem(outputIndex int, raw json.RawMessage, send func(*schema.Message) bool) error {
 	var item responsesStreamOutputItem
 	if json.Unmarshal(raw, &item) != nil || outputIndex < 0 {
@@ -249,6 +271,9 @@ func (state *responsesStreamState) addItem(outputIndex int, raw json.RawMessage,
 	}
 	if _, exists := state.outputs[outputIndex]; exists || len(state.outputs) >= maxResponsesOutputs ||
 		(item.Type != "function_call" && item.Type != "reasoning" && item.Type != "message") {
+		return errInvalidResponsesEvent
+	}
+	if !state.claimItemID(outputIndex, item.ID) {
 		return errInvalidResponsesEvent
 	}
 	state.outputs[outputIndex] = item.Type
@@ -261,10 +286,11 @@ func (state *responsesStreamState) addItem(outputIndex int, raw json.RawMessage,
 	if item.Type != "function_call" {
 		return nil
 	}
-	if _, exists := state.calls[outputIndex]; exists || strings.TrimSpace(item.Name) == "" || item.Arguments != "" {
+	if _, exists := state.calls[outputIndex]; exists || strings.TrimSpace(item.Name) == "" || item.Arguments != "" ||
+		!state.claimCallID(outputIndex, item.CallID) {
 		return errInvalidResponsesEvent
 	}
-	call := &responsesStreamCall{index: state.nextCall, itemID: item.ID, name: item.Name, callID: item.CallID}
+	call := &responsesStreamCall{index: state.nextCall, name: item.Name, callID: item.CallID}
 	state.nextCall++
 	state.sawToolCall = true
 	state.calls[outputIndex] = call
@@ -308,6 +334,9 @@ func (state *responsesStreamState) finishItem(outputIndex int, raw json.RawMessa
 	if json.Unmarshal(raw, &item) != nil || outputIndex < 0 || state.finished[outputIndex] || (item.Status != "" && item.Status != "completed") {
 		return errInvalidResponsesEvent
 	}
+	if !state.claimItemID(outputIndex, item.ID) {
+		return errInvalidResponsesEvent
+	}
 	if expected, exists := state.outputs[outputIndex]; exists && expected != item.Type {
 		return errInvalidResponsesEvent
 	} else if !exists {
@@ -318,12 +347,13 @@ func (state *responsesStreamState) finishItem(outputIndex int, raw json.RawMessa
 	}
 	switch item.Type {
 	case "function_call":
-		if item.CallID == "" || strings.TrimSpace(item.Name) == "" || !json.Valid([]byte(item.Arguments)) {
+		if item.CallID == "" || strings.TrimSpace(item.Name) == "" || !json.Valid([]byte(item.Arguments)) ||
+			!state.claimCallID(outputIndex, item.CallID) {
 			return errInvalidResponsesEvent
 		}
 		call, exists := state.calls[outputIndex]
 		if !exists {
-			call = &responsesStreamCall{index: state.nextCall, itemID: item.ID, name: item.Name, callID: item.CallID, completed: true}
+			call = &responsesStreamCall{index: state.nextCall, name: item.Name, callID: item.CallID, completed: true}
 			state.nextCall++
 			state.sawToolCall = true
 			if !state.retain(len(item.Arguments)) {
@@ -337,16 +367,13 @@ func (state *responsesStreamState) finishItem(outputIndex int, raw json.RawMessa
 			}
 			return nil
 		}
-		if call.completed || call.name != item.Name || (call.itemID != "" && item.ID != "" && call.itemID != item.ID) ||
-			(call.callID != "" && call.callID != item.CallID) || (call.doneArgs != nil && *call.doneArgs != item.Arguments) {
+		if call.completed || call.name != item.Name || (call.callID != "" && call.callID != item.CallID) ||
+			(call.doneArgs != nil && *call.doneArgs != item.Arguments) {
 			return errInvalidResponsesEvent
 		}
 		needsBackfill := call.callID == ""
 		if needsBackfill {
 			call.callID = item.CallID
-		}
-		if call.itemID == "" {
-			call.itemID = item.ID
 		}
 		if call.sawDelta {
 			if call.arguments.String() != item.Arguments {
@@ -374,13 +401,8 @@ func (state *responsesStreamState) finishItem(outputIndex int, raw json.RawMessa
 		}
 		state.reasoning[outputIndex] = append(json.RawMessage(nil), raw...)
 	case "message":
-		if item.Role != "assistant" || item.Content == nil {
-			return errInvalidResponsesEvent
-		}
-		for _, content := range item.Content {
-			if content.Type != "output_text" || content.Text == nil {
-				return errInvalidResponsesEvent
-			}
+		if err := state.reconcileMessage(outputIndex, item, send); err != nil {
+			return err
 		}
 	default:
 		return errInvalidResponsesEvent
@@ -397,9 +419,17 @@ func (state *responsesStreamState) complete(raw json.RawMessage, send func(*sche
 	}
 	seenCalls := make(map[int]struct{})
 	seenReasoning := make(map[int]struct{})
+	var pending []*schema.Message
+	stage := func(message *schema.Message) bool {
+		pending = append(pending, message)
+		return false
+	}
 	for outputIndex, rawItem := range response.Output {
 		var item responsesStreamOutputItem
 		if json.Unmarshal(rawItem, &item) != nil || (item.Status != "" && item.Status != "completed") {
+			return nil, responsesAPIFailure(errInvalidResponsesResponse)
+		}
+		if !state.claimItemID(outputIndex, item.ID) {
 			return nil, responsesAPIFailure(errInvalidResponsesResponse)
 		}
 		if expected, exists := state.outputs[outputIndex]; exists && expected != item.Type {
@@ -407,28 +437,11 @@ func (state *responsesStreamState) complete(raw json.RawMessage, send func(*sche
 		}
 		switch item.Type {
 		case "message":
-			if item.Role != "assistant" || item.Content == nil {
+			if err := state.reconcileMessage(outputIndex, item, stage); err != nil {
 				return nil, responsesAPIFailure(errInvalidResponsesResponse)
-			}
-			var terminalText strings.Builder
-			for _, content := range item.Content {
-				if content.Type != "output_text" || content.Text == nil {
-					return nil, responsesAPIFailure(errInvalidResponsesResponse)
-				}
-				terminalText.WriteString(*content.Text)
-			}
-			emitted := ""
-			if builder := state.text[outputIndex]; builder != nil {
-				emitted = builder.String()
-			}
-			if !strings.HasPrefix(terminalText.String(), emitted) {
-				return nil, responsesAPIFailure(errInvalidResponsesResponse)
-			}
-			if suffix := strings.TrimPrefix(terminalText.String(), emitted); suffix != "" && send(&schema.Message{Role: schema.Assistant, Content: suffix}) {
-				return nil, errResponsesConsumerGone
 			}
 		case "function_call":
-			if err := state.reconcileCall(outputIndex, rawItem, send); err != nil {
+			if err := state.reconcileCall(outputIndex, rawItem, stage); err != nil {
 				return nil, err
 			}
 			seenCalls[outputIndex] = struct{}{}
@@ -466,6 +479,11 @@ func (state *responsesStreamState) complete(raw json.RawMessage, send func(*sche
 			return nil, responsesAPIFailure(errInvalidResponsesResponse)
 		}
 	}
+	for _, message := range pending {
+		if send(message) {
+			return nil, errResponsesConsumerGone
+		}
+	}
 	finish := "stop"
 	if state.sawToolCall {
 		finish = "tool_calls"
@@ -485,12 +503,13 @@ func (state *responsesStreamState) complete(raw json.RawMessage, send func(*sche
 
 func (state *responsesStreamState) reconcileCall(outputIndex int, raw json.RawMessage, send func(*schema.Message) bool) error {
 	var item responsesStreamOutputItem
-	if json.Unmarshal(raw, &item) != nil || item.CallID == "" || strings.TrimSpace(item.Name) == "" || !json.Valid([]byte(item.Arguments)) {
+	if json.Unmarshal(raw, &item) != nil || item.CallID == "" || strings.TrimSpace(item.Name) == "" ||
+		!json.Valid([]byte(item.Arguments)) || !state.claimCallID(outputIndex, item.CallID) {
 		return responsesAPIFailure(errInvalidResponsesResponse)
 	}
 	call, exists := state.calls[outputIndex]
 	if !exists {
-		call = &responsesStreamCall{index: state.nextCall, itemID: item.ID, name: item.Name, callID: item.CallID, completed: true}
+		call = &responsesStreamCall{index: state.nextCall, name: item.Name, callID: item.CallID, completed: true}
 		state.nextCall++
 		state.sawToolCall = true
 		if !state.retain(len(item.Arguments)) {
@@ -503,8 +522,8 @@ func (state *responsesStreamState) reconcileCall(outputIndex int, raw json.RawMe
 		}
 		return nil
 	}
-	if call.name != item.Name || (call.itemID != "" && item.ID != "" && call.itemID != item.ID) ||
-		(call.callID != "" && call.callID != item.CallID) || (call.doneArgs != nil && *call.doneArgs != item.Arguments) {
+	if call.name != item.Name || (call.callID != "" && call.callID != item.CallID) ||
+		(call.doneArgs != nil && *call.doneArgs != item.Arguments) {
 		return responsesAPIFailure(errInvalidResponsesResponse)
 	}
 	needsBackfill := call.callID == ""
@@ -533,6 +552,69 @@ func (state *responsesStreamState) reconcileCall(outputIndex int, raw json.RawMe
 	return nil
 }
 
+func (state *responsesStreamState) reconcileMessage(outputIndex int, item responsesStreamOutputItem, send func(*schema.Message) bool) error {
+	if item.Role != "assistant" || item.Content == nil {
+		return errInvalidResponsesEvent
+	}
+	var snapshot strings.Builder
+	for _, content := range item.Content {
+		if content.Type != "output_text" || content.Text == nil {
+			return errInvalidResponsesEvent
+		}
+		snapshot.WriteString(*content.Text)
+	}
+	builder := state.text[outputIndex]
+	if builder == nil {
+		builder = new(strings.Builder)
+		state.text[outputIndex] = builder
+	}
+	emitted := builder.String()
+	if state.finished[outputIndex] {
+		if snapshot.String() != emitted {
+			return errInvalidResponsesEvent
+		}
+		return nil
+	}
+	if !strings.HasPrefix(snapshot.String(), emitted) {
+		return errInvalidResponsesEvent
+	}
+	suffix := strings.TrimPrefix(snapshot.String(), emitted)
+	if !state.retain(len(suffix)) {
+		return errResponsesEventTooLarge
+	}
+	builder.WriteString(suffix)
+	if suffix != "" && send(&schema.Message{Role: schema.Assistant, Content: suffix}) {
+		return errResponsesConsumerGone
+	}
+	return nil
+}
+
+func (state *responsesStreamState) claimCallID(outputIndex int, callID string) bool {
+	if callID == "" {
+		return true
+	}
+	if owner, exists := state.callIDs[callID]; exists && owner != outputIndex {
+		return false
+	}
+	state.callIDs[callID] = outputIndex
+	return true
+}
+
+func (state *responsesStreamState) claimItemID(outputIndex int, itemID string) bool {
+	if expected := state.outputIDs[outputIndex]; expected != "" && itemID != "" && expected != itemID {
+		return false
+	}
+	if itemID == "" {
+		return true
+	}
+	if owner, exists := state.itemIDs[itemID]; exists && owner != outputIndex {
+		return false
+	}
+	state.outputIDs[outputIndex] = itemID
+	state.itemIDs[itemID] = outputIndex
+	return true
+}
+
 func (state *responsesStreamState) retain(size int) bool {
 	if size < 0 || state.retained > maxResponsesEventBytes-size {
 		return false
@@ -550,13 +632,18 @@ func responsesToolCallChunk(call *responsesStreamCall, arguments string) *schema
 }
 
 func responsesJSONEqual(left, right json.RawMessage) bool {
-	var leftValue, rightValue any
-	return json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil &&
-		jsonValuesEqual(leftValue, rightValue)
+	leftJSON, leftOK := canonicalResponsesJSON(left)
+	rightJSON, rightOK := canonicalResponsesJSON(right)
+	return leftOK && rightOK && bytes.Equal(leftJSON, rightJSON)
 }
 
-func jsonValuesEqual(left, right any) bool {
-	leftJSON, leftErr := json.Marshal(left)
-	rightJSON, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+func canonicalResponsesJSON(raw json.RawMessage) ([]byte, bool) {
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return nil, false
+	}
+	encoded, err := json.Marshal(value)
+	return encoded, err == nil
 }
