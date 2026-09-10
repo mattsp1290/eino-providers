@@ -17,10 +17,6 @@ import (
 // transport boundary.
 const sdkValidationPlaceholder = "opencode-go-sdk-placeholder"
 
-func protocolImplemented(protocol Protocol) bool {
-	return protocol == ProtocolChatCompletions || protocol == ProtocolMessages
-}
-
 // cloneTools converts parameter descriptions into an owned JSON Schema. The
 // pinned OpenAI adapter sorts schema fields while binding, so passing caller
 // objects directly would let one derived model mutate another's inputs.
@@ -66,7 +62,7 @@ func newProtocolAdapter(ctx context.Context, cfg preparedConfig) (model.ToolCall
 	case ProtocolMessages:
 		return newMessagesAdapter(ctx, cfg)
 	case ProtocolResponses:
-		return nil, fmt.Errorf("opencodego: Responses adapter is not available")
+		return newResponsesAdapter(ctx, cfg)
 	default:
 		return nil, fmt.Errorf("opencodego: unsupported Protocol %q", cfg.protocol)
 	}

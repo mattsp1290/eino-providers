@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cloudwego/eino/components/model"
@@ -218,6 +219,179 @@ func TestResponsesGenerateUsesNativeAuthAndDecodesOutput(t *testing.T) {
 	items, ok := message.Extra[responsesReasoningItemsKey].([]json.RawMessage)
 	if !ok || len(items) != 1 || !bytes.Contains(items[0], []byte(`"opaque"`)) {
 		t.Fatalf("reasoning = %#v", message.Extra)
+	}
+}
+
+func TestChatModelResponsesCompletesAuthenticatedTwoTurnToolLoop(t *testing.T) {
+	var requests []responsesRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" || r.Method != http.MethodPost {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer real-key" || r.Header.Get("X-Api-Key") != "" ||
+			r.Header.Get("X-OpenCode-Session") != "operation-session" || r.Header.Get("User-Agent") != "responses-public-test/1" {
+			t.Errorf("auth/session/agent = %q/%q/%q/%q", r.Header.Get("Authorization"), r.Header.Get("X-Api-Key"), r.Header.Get("X-OpenCode-Session"), r.Header.Get("User-Agent"))
+		}
+		var request responsesRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		requests = append(requests, request)
+		w.Header().Set("Content-Type", "application/json")
+		switch len(requests) {
+		case 1:
+			_, _ = io.WriteString(w, `{
+				"status":"completed",
+				"output":[
+					{"type":"reasoning","status":"completed","encrypted_content":"opaque","summary":[]},
+					{"type":"function_call","status":"completed","name":"weather","arguments":"{\"city\":\"NYC\"}","call_id":"call_weather"},
+					{"type":"function_call","status":"completed","name":"clock","arguments":"{}","call_id":"call_clock"}
+				],
+				"usage":{"input_tokens":6,"output_tokens":4,"total_tokens":10}
+			}`)
+		case 2:
+			var joined []byte
+			for _, item := range request.Input {
+				joined = append(joined, item...)
+			}
+			for _, required := range [][]byte{
+				[]byte(`"type":"reasoning"`), []byte(`"encrypted_content":"opaque"`),
+				[]byte(`"call_id":"call_weather"`), []byte(`"call_id":"call_clock"`),
+				[]byte(`"type":"function_call_output"`),
+			} {
+				if !bytes.Contains(joined, required) {
+					t.Errorf("replayed input missing %s: %s", required, joined)
+				}
+			}
+			_, _ = io.WriteString(w, `{
+				"status":"completed",
+				"output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"It is 72 degrees at noon."}]}],
+				"usage":{"input_tokens":12,"output_tokens":6,"total_tokens":18}
+			}`)
+		default:
+			t.Errorf("unexpected request %d", len(requests))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cm, err := NewChatModel(context.Background(), ChatModelConfig{
+		Model: "fixture-model", Protocol: ProtocolResponses, APIKey: "real-key", UserAgent: "responses-public-test/1",
+		SessionID: "fallback-session", BaseURL: server.URL + "/v1", HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []*schema.ToolInfo{
+		{Name: "weather", Desc: "Get weather", ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"city": {Type: schema.String, Required: true},
+		})},
+		{Name: "clock", Desc: "Get local time"},
+	}
+	cm, err = cm.WithTools(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := opencodeauth.WithSessionID(context.Background(), "operation-session")
+	first, err := cm.Generate(ctx, []*schema.Message{schema.UserMessage("Weather and time?")}, model.WithMaxTokens(40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.ToolCalls) != 2 || first.ResponseMeta == nil || first.ResponseMeta.Usage == nil || first.ResponseMeta.Usage.TotalTokens != 10 {
+		t.Fatalf("first response = %#v", first)
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed schema.Message
+	if unmarshalErr := json.Unmarshal(encoded, &replayed); unmarshalErr != nil {
+		t.Fatal(unmarshalErr)
+	}
+	second, err := cm.Generate(ctx, []*schema.Message{
+		schema.UserMessage("Weather and time?"),
+		&replayed,
+		schema.ToolMessage(`{"temperature":72}`, "call_weather"),
+		{Role: schema.Tool, ToolCallID: "call_clock", ToolName: "clock", Content: "12:00"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Content != "It is 72 degrees at noon." || second.ResponseMeta == nil || second.ResponseMeta.Usage == nil || second.ResponseMeta.Usage.TotalTokens != 18 {
+		t.Fatalf("second response = %#v", second)
+	}
+	if len(requests) != 2 || len(requests[0].Tools) != 2 || len(requests[1].Tools) != 2 ||
+		requests[0].MaxOutputTokens == nil || *requests[0].MaxOutputTokens != 40 ||
+		fmt.Sprint(requests[0].Include) != "[reasoning.encrypted_content]" || fmt.Sprint(requests[1].Include) != "[reasoning.encrypted_content]" {
+		t.Fatalf("requests = %#v", requests)
+	}
+}
+
+func TestChatModelResponsesOwnsConcurrentSessionsAndToolSchemas(t *testing.T) {
+	var mu sync.Mutex
+	sessions := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request responsesRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		if len(request.Tools) != 1 || request.Tools[0].Name != "lookup" {
+			t.Errorf("tools = %#v", request.Tools)
+		}
+		mu.Lock()
+		sessions[r.Header.Get("X-OpenCode-Session")]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`)
+	}))
+	t.Cleanup(server.Close)
+	cm, err := NewChatModel(context.Background(), ChatModelConfig{
+		Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "responses-concurrent-test/1",
+		SessionID: "fallback", BaseURL: server.URL + "/v1", HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters, err := schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"z": {Type: schema.String, Required: true},
+		"a": {Type: schema.String, Required: true},
+	}).ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters.Required = []string{"z", "a"}
+	option := model.WithTools([]*schema.ToolInfo{{Name: "lookup", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(parameters)}})
+
+	const operations = 8
+	errs := make(chan error, operations)
+	for i := range operations {
+		go func() {
+			ctx := opencodeauth.WithSessionID(context.Background(), fmt.Sprintf("session-%d", i))
+			message, generateErr := cm.Generate(ctx, []*schema.Message{schema.UserMessage("lookup")}, option)
+			if generateErr == nil && (message == nil || message.Content != "ok") {
+				generateErr = fmt.Errorf("message = %#v", message)
+			}
+			errs <- generateErr
+		}()
+	}
+	for range operations {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sessions) != operations {
+		t.Fatalf("sessions = %#v", sessions)
+	}
+	for i := range operations {
+		if sessions[fmt.Sprintf("session-%d", i)] != 1 {
+			t.Fatalf("sessions = %#v", sessions)
+		}
+	}
+	if got := fmt.Sprint(parameters.Required); got != "[z a]" {
+		t.Fatalf("caller schema Required mutated to %s", got)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cloudwego/eino/components/model"
@@ -408,13 +409,20 @@ func TestChatModelMessagesMapsHTTPError(t *testing.T) {
 	}
 }
 
-func TestNewChatModelRejectsUnavailableProtocols(t *testing.T) {
-	for _, cfg := range []ChatModelConfig{
-		{Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "test/1"},
-	} {
-		if _, err := NewChatModel(context.Background(), cfg); !errors.Is(err, einoproviders.ErrProviderInit) {
-			t.Fatalf("protocol %q error = %v, want ErrProviderInit", cfg.Protocol, err)
-		}
+func TestNewChatModelConstructsResponsesWithoutNetwork(t *testing.T) {
+	var calls atomic.Int32
+	cm, err := NewChatModel(context.Background(), ChatModelConfig{
+		Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "test/1",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return nil, errors.New("unexpected network request")
+		})},
+	})
+	if err != nil {
+		t.Fatalf("NewChatModel: %v", err)
+	}
+	if cm == nil || calls.Load() != 0 {
+		t.Fatalf("model/calls = %T/%d", cm, calls.Load())
 	}
 }
 

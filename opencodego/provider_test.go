@@ -82,17 +82,47 @@ func TestBlankImportRegistersProviderAndAdvise(t *testing.T) {
 	}
 }
 
-func TestProviderRejectsUnavailableProtocolsAtConstruction(t *testing.T) {
+func TestProviderResponsesAdviseUsesNativeRoute(t *testing.T) {
 	t.Setenv("OPENCODE_GO_API_KEY", "")
-	for _, protocol := range []string{"responses"} {
-		t.Run(protocol, func(t *testing.T) {
-			_, err := einoproviders.NewProvider(context.Background(), "opencode-go", "fixture", einoproviders.Options{
-				APIKey: "key", Protocol: protocol, UserAgent: "provider-test/1",
-			})
-			if !errors.Is(err, einoproviders.ErrProviderInit) {
-				t.Fatalf("error = %v, want ErrProviderInit", err)
-			}
-		})
+	var request struct {
+		Instructions    string `json:"instructions"`
+		MaxOutputTokens int    `json:"max_output_tokens"`
+		Input           []struct {
+			Role string `json:"role"`
+		} `json:"input"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" || r.Header.Get("Authorization") != "Bearer key" || r.Header.Get("X-OpenCode-Session") != "session" {
+			t.Errorf("path/auth/session = %q/%q/%q", r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("X-OpenCode-Session"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"completed",
+			"output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"response answer"}]}],
+			"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}
+		}`))
+	}))
+	t.Cleanup(server.Close)
+	baseURL := server.URL + "/v1"
+	provider, err := einoproviders.NewProvider(context.Background(), "opencode-go", "fixture", einoproviders.Options{
+		APIKey: "key", Protocol: "responses", UserAgent: "provider-test/1", SessionID: "session",
+		BaseURL: &baseURL, HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	text, usage, err := provider.Advise(context.Background(), "system", "user", 17)
+	if err != nil {
+		t.Fatalf("Advise: %v", err)
+	}
+	if text != "response answer" || usage != (einoproviders.Usage{InputTokens: 5, OutputTokens: 2, Available: true}) {
+		t.Fatalf("Advise = %q, %+v", text, usage)
+	}
+	if request.Instructions != "system" || request.MaxOutputTokens != 17 || len(request.Input) != 1 || request.Input[0].Role != "user" {
+		t.Fatalf("request = %#v", request)
 	}
 }
 
