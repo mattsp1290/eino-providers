@@ -5,8 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/schema"
 
@@ -148,6 +153,331 @@ func TestResponsesStreamHonorsContextAndConsumerClosure(t *testing.T) {
 	if !errors.Is(err, errResponsesConsumerGone) {
 		t.Fatalf("consumer error = %v", err)
 	}
+}
+
+func TestResponsesModelStreamAuthenticatesAndStopsAtTerminal(t *testing.T) {
+	serverReleased := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(serverReleased)
+		if r.URL.Path != "/v1/responses" || r.Header.Get("Authorization") != "Bearer key" ||
+			r.Header.Get("X-OpenCode-Session") != "session" || r.Header.Get("Accept") != "text/event-stream" {
+			t.Errorf("request path/auth/session/accept = %q/%q/%q/%q", r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("X-OpenCode-Session"), r.Header.Get("Accept"))
+		}
+		requestBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+		}
+		for _, field := range [][]byte{[]byte(`"stream":true`), []byte(`"store":false`), []byte(`"reasoning.encrypted_content"`)} {
+			if !bytes.Contains(requestBody, field) {
+				t.Errorf("request body missing %s: %s", field, requestBody)
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, responsesSSE(
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+			`{"type":"response.output_text.delta","output_index":0,"delta":"hello"}`,
+			`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`,
+		))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+	stream, err := newResponsesModelAtServer(t, server).Stream(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := receiveResponsesChunks(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := schema.ConcatMessages(chunks)
+	if err != nil || message.Content != "hello" || message.ResponseMeta == nil || message.ResponseMeta.Usage.TotalTokens != 3 {
+		t.Fatalf("message/error = %#v/%v", message, err)
+	}
+	select {
+	case <-serverReleased:
+	case <-time.After(time.Second):
+		t.Fatal("terminal completion did not close the held-open response")
+	}
+}
+
+func TestResponsesModelStreamDeliversTextBeforeCompletion(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, responsesSSE(
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`,
+			`{"type":"response.output_text.delta","output_index":0,"delta":"visible"}`,
+		))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, responsesSSE(
+			`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible"}]}]}}`,
+		))
+		w.(http.Flusher).Flush()
+	}))
+	t.Cleanup(server.Close)
+	stream, err := newResponsesModelAtServer(t, server).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	first := make(chan struct {
+		message *schema.Message
+		err     error
+	}, 1)
+	go func() {
+		message, recvErr := stream.Recv()
+		first <- struct {
+			message *schema.Message
+			err     error
+		}{message, recvErr}
+	}()
+	select {
+	case result := <-first:
+		if result.err != nil || result.message == nil || result.message.Content != "visible" {
+			t.Fatalf("first chunk/error = %#v/%v", result.message, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("text delta was buffered until completion")
+	}
+	releaseOnce.Do(func() { close(release) })
+	for {
+		_, err = stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestResponsesModelStreamCancellationClosesBlockedBody(t *testing.T) {
+	body := newBlockingResponsesBody()
+	model := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body))
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := model.Stream(ctx, []*schema.Message{schema.UserMessage("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	_, err = stream.Recv()
+	stream.Close()
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Recv error = %v", err)
+	}
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not close body")
+	}
+	if body.closeCount() != 1 {
+		t.Fatalf("close count = %d", body.closeCount())
+	}
+}
+
+func TestResponsesModelStreamReaderCloseReleasesBlockedProducer(t *testing.T) {
+	events := []string{`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}`}
+	for range 40 {
+		events = append(events, `{"type":"response.output_text.delta","output_index":0,"delta":"x"}`)
+	}
+	body := &trackedBody{Reader: strings.NewReader(responsesSSE(events...))}
+	stream, err := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	stream.Close()
+	deadline := time.Now().Add(time.Second)
+	for body.closeCount() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if body.closeCount() != 1 {
+		t.Fatal("reader Close did not release producer and close body")
+	}
+}
+
+func TestResponsesModelStreamContainsBodyPanics(t *testing.T) {
+	t.Run("read", func(t *testing.T) {
+		body := &panicResponsesBody{canary: "secret-read-panic"}
+		stream, err := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		_, err = stream.Recv()
+		if !errors.Is(err, einoproviders.ErrProviderAPI) || strings.Contains(err.Error(), body.canary) {
+			t.Fatalf("panic error = %v", err)
+		}
+		if body.closeCount() != 1 {
+			t.Fatalf("close count = %d", body.closeCount())
+		}
+	})
+	t.Run("close", func(t *testing.T) {
+		body := &panicCloseResponsesBody{Reader: strings.NewReader(responsesSSE(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)), canary: "secret-close-panic"}
+		stream, err := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		_, err = stream.Recv()
+		if !errors.Is(err, einoproviders.ErrProviderAPI) || strings.Contains(err.Error(), body.canary) {
+			t.Fatalf("panic error = %v", err)
+		}
+		if body.closeCount() != 1 {
+			t.Fatalf("close count = %d", body.closeCount())
+		}
+	})
+}
+
+func TestResponsesModelStreamRejectsInvalidHTTPResponseAndClosesBody(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        io.ReadCloser
+		wantAPI     bool
+	}{
+		{name: "status", status: http.StatusInternalServerError, contentType: "text/event-stream"},
+		{name: "content type", status: http.StatusOK, contentType: "application/json", wantAPI: true},
+		{name: "close panic", status: http.StatusOK, contentType: "application/json", body: &panicCloseResponsesBody{Reader: strings.NewReader("secret response"), canary: "secret-close-panic"}, wantAPI: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := tt.body
+			if body == nil {
+				body = &trackedBody{Reader: strings.NewReader("secret response")}
+			}
+			_, err := newDirectResponsesModel(t, responsesHTTPClient(tt.status, tt.contentType, body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+			if err == nil || (tt.wantAPI && !errors.Is(err, einoproviders.ErrProviderAPI)) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("Stream error = %v", err)
+			}
+			counter, ok := body.(interface{ closeCount() int })
+			if !ok {
+				t.Fatalf("body %T does not expose close count", body)
+			}
+			if counter.closeCount() != 1 {
+				t.Fatalf("close count = %d", counter.closeCount())
+			}
+		})
+	}
+}
+
+func responsesHTTPClient(status int, contentType string, body io.ReadCloser) *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {contentType}}, Body: body, Request: req}, nil
+	})}
+}
+
+func receiveResponsesChunks(stream *schema.StreamReader[*schema.Message]) ([]*schema.Message, error) {
+	defer stream.Close()
+	var chunks []*schema.Message
+	for {
+		chunk, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return chunks, nil
+		}
+		if err != nil {
+			return chunks, err
+		}
+		chunks = append(chunks, chunk)
+	}
+}
+
+func newResponsesModelAtServer(t *testing.T, server *httptest.Server) *responsesModel {
+	t.Helper()
+	prepared, err := prepareConfig(ChatModelConfig{
+		Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "responses-stream-test/1",
+		SessionID: "session", BaseURL: server.URL + "/v1", HTTPClient: server.Client(),
+	}, chatModelConstruction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := newResponsesAdapter(context.Background(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adapter.(*responsesModel)
+}
+
+type blockingResponsesBody struct {
+	closed chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	closes int
+}
+
+func newBlockingResponsesBody() *blockingResponsesBody {
+	return &blockingResponsesBody{closed: make(chan struct{})}
+}
+
+func (body *blockingResponsesBody) Read([]byte) (int, error) {
+	<-body.closed
+	return 0, errors.New("body closed")
+}
+
+func (body *blockingResponsesBody) Close() error {
+	body.mu.Lock()
+	body.closes++
+	body.mu.Unlock()
+	body.once.Do(func() { close(body.closed) })
+	return nil
+}
+
+func (body *blockingResponsesBody) closeCount() int {
+	body.mu.Lock()
+	defer body.mu.Unlock()
+	return body.closes
+}
+
+type panicResponsesBody struct {
+	canary string
+	mu     sync.Mutex
+	closes int
+}
+
+func (body *panicResponsesBody) Read([]byte) (int, error) { panic(body.canary) }
+
+func (body *panicResponsesBody) Close() error {
+	body.mu.Lock()
+	defer body.mu.Unlock()
+	body.closes++
+	return nil
+}
+
+func (body *panicResponsesBody) closeCount() int {
+	body.mu.Lock()
+	defer body.mu.Unlock()
+	return body.closes
+}
+
+type panicCloseResponsesBody struct {
+	io.Reader
+	canary string
+	mu     sync.Mutex
+	closes int
+}
+
+func (body *panicCloseResponsesBody) Close() error {
+	body.mu.Lock()
+	body.closes++
+	body.mu.Unlock()
+	panic(body.canary)
+}
+
+func (body *panicCloseResponsesBody) closeCount() int {
+	body.mu.Lock()
+	defer body.mu.Unlock()
+	return body.closes
 }
 
 func parseAndConcatResponses(t *testing.T, body string) *schema.Message {
