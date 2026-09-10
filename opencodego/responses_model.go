@@ -163,15 +163,15 @@ func runResponsesStream(ctx context.Context, cancel context.CancelFunc, body io.
 		return
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		_ = writer.Send(nil, ctxErr)
+		_ = writer.Send(nil, responsesReceiveFailure(ctxErr))
 		return
 	}
 	if parseErr != nil {
-		_ = writer.Send(nil, responsesStreamFailure(parseErr))
+		_ = writer.Send(nil, responsesReceiveFailure(parseErr))
 		return
 	}
 	if closeErr != nil {
-		_ = writer.Send(nil, responsesStreamFailure(closeErr))
+		_ = writer.Send(nil, responsesReceiveFailure(closeErr))
 		return
 	}
 	_ = writer.Send(terminal, nil)
@@ -211,6 +211,10 @@ func responsesStreamFailure(err error) error {
 		return err
 	}
 	return responsesAPIFailure(err)
+}
+
+func responsesReceiveFailure(err error) error {
+	return mapInvocationError(operationReceive, responsesStreamFailure(err), nil)
 }
 
 func (m *responsesModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {

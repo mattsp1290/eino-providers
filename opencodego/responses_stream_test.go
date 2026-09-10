@@ -276,6 +276,9 @@ func TestResponsesModelStreamCancellationClosesBlockedBody(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Recv error = %v", err)
 	}
+	if err.Error() != "opencode-go: receive failed" {
+		t.Fatalf("Recv error label = %q", err)
+	}
 	select {
 	case <-body.closed:
 	case <-time.After(time.Second):
@@ -316,7 +319,7 @@ func TestResponsesModelStreamContainsBodyPanics(t *testing.T) {
 		}
 		defer stream.Close()
 		_, err = stream.Recv()
-		if !errors.Is(err, einoproviders.ErrProviderAPI) || strings.Contains(err.Error(), body.canary) {
+		if !errors.Is(err, einoproviders.ErrProviderAPI) || err.Error() != "opencode-go: receive failed" || strings.Contains(err.Error(), body.canary) {
 			t.Fatalf("panic error = %v", err)
 		}
 		if body.closeCount() != 1 {
@@ -331,13 +334,29 @@ func TestResponsesModelStreamContainsBodyPanics(t *testing.T) {
 		}
 		defer stream.Close()
 		_, err = stream.Recv()
-		if !errors.Is(err, einoproviders.ErrProviderAPI) || strings.Contains(err.Error(), body.canary) {
+		if !errors.Is(err, einoproviders.ErrProviderAPI) || err.Error() != "opencode-go: receive failed" || strings.Contains(err.Error(), body.canary) {
 			t.Fatalf("panic error = %v", err)
 		}
 		if body.closeCount() != 1 {
 			t.Fatalf("close count = %d", body.closeCount())
 		}
 	})
+}
+
+func TestChatModelResponsesStreamMapsMalformedEventAsReceiveFailure(t *testing.T) {
+	body := &trackedBody{Reader: strings.NewReader(responsesSSE(`{"type":"response.failed","response":{"error":{"message":"secret-event"}}}`))}
+	stream, err := newPublicResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	_, err = stream.Recv()
+	if !errors.Is(err, einoproviders.ErrProviderAPI) {
+		t.Fatalf("Recv error classification = %v", err)
+	}
+	if err.Error() != "opencode-go: receive failed" || strings.Contains(err.Error(), "secret-event") {
+		t.Fatalf("Recv error = %v", err)
+	}
 }
 
 func TestResponsesModelStreamRejectsInvalidHTTPResponseAndClosesBody(t *testing.T) {
