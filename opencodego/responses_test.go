@@ -14,6 +14,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	opencodeauth "github.com/mattsp1290/opencode-auth-go"
 
 	einoproviders "github.com/mattsp1290/eino-providers"
 )
@@ -165,7 +166,7 @@ func TestResponsesGenerateUsesNativeAuthAndDecodesOutput(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer real-key" {
 			t.Errorf("Authorization = %q", got)
 		}
-		if got := r.Header.Get("X-OpenCode-Session"); got != "responses-session" {
+		if got := r.Header.Get("X-OpenCode-Session"); got != "operation-session" {
 			t.Errorf("session = %q", got)
 		}
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -196,7 +197,8 @@ func TestResponsesGenerateUsesNativeAuthAndDecodesOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, err := adapter.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+	ctx := opencodeauth.WithSessionID(context.Background(), "operation-session")
+	message, err := adapter.Generate(ctx, []*schema.Message{schema.UserMessage("hello")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,6 +244,17 @@ func TestResponsesGeneratePreservesUsagePresence(t *testing.T) {
 	}
 }
 
+func TestResponsesGenerateAllowsToolOnlyCompletion(t *testing.T) {
+	adapter := responseBodyModel(t, `{"status":"completed","output":[{"type":"function_call","status":"completed","name":"tool","arguments":"{}","call_id":"call_1"}]}`)
+	message, err := adapter.Generate(context.Background(), []*schema.Message{schema.UserMessage("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Content != "" || len(message.ToolCalls) != 1 || message.ResponseMeta.FinishReason != "tool_calls" {
+		t.Fatalf("message = %#v", message)
+	}
+}
+
 func TestResponsesInvalidResponsesReturnNoPartialSuccess(t *testing.T) {
 	tests := []struct{ name, body string }{
 		{name: "malformed json", body: `{`},
@@ -253,10 +266,16 @@ func TestResponsesInvalidResponsesReturnNoPartialSuccess(t *testing.T) {
 		{name: "bad message role", body: `{"status":"completed","output":[{"type":"message","role":"user","content":[]}]}`},
 		{name: "missing message content", body: `{"status":"completed","output":[{"type":"message","role":"assistant"}]}`},
 		{name: "bad message content", body: `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","text":"no"}]}]}`},
+		{name: "missing output text", body: `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text"}]}]}`},
+		{name: "null output text", body: `{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":null}]}]}`},
 		{name: "bad call", body: `{"status":"completed","output":[{"type":"function_call","name":"tool","arguments":"{","call_id":"call"}]}`},
 		{name: "duplicate call", body: `{"status":"completed","output":[{"type":"function_call","name":"tool","arguments":"{}","call_id":"call"},{"type":"function_call","name":"tool","arguments":"{}","call_id":"call"}]}`},
 		{name: "bad reasoning", body: `{"status":"completed","output":[{"type":"reasoning","encrypted_content":""}]}`},
 		{name: "negative usage", body: `{"status":"completed","output":[],"usage":{"input_tokens":-1}}`},
+		{name: "missing usage counter", body: `{"status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0}}`},
+		{name: "null usage counter", body: `{"status":"completed","output":[],"usage":{"input_tokens":null,"output_tokens":0,"total_tokens":0}}`},
+		{name: "missing cached counter", body: `{"status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"input_tokens_details":{}}}`},
+		{name: "null reasoning counter", body: `{"status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0,"output_tokens_details":{"reasoning_tokens":null}}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -267,6 +286,57 @@ func TestResponsesInvalidResponsesReturnNoPartialSuccess(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "secret") {
 				t.Fatalf("error leaked response: %v", err)
+			}
+		})
+	}
+}
+
+func TestResponsesGenerateLetsFacadeClassifyHTTPFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		status   int
+		wantAuth bool
+		wantAPI  bool
+	}{
+		{name: "authentication", status: http.StatusUnauthorized, wantAuth: true},
+		{name: "server", status: http.StatusInternalServerError, wantAPI: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				errorType := "server_error"
+				if tt.wantAuth {
+					errorType = "authentication_error"
+				}
+				_, _ = io.WriteString(w, `{"error":{"type":"`+errorType+`","message":"secret-upstream-detail"}}`)
+			}))
+			t.Cleanup(server.Close)
+			prepared, err := prepareConfig(ChatModelConfig{
+				Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "responses-test/1",
+				SessionID: "session", BaseURL: server.URL + "/v1", HTTPClient: server.Client(),
+			}, chatModelConstruction)
+			if err != nil {
+				t.Fatal(err)
+			}
+			delegate, err := newResponsesAdapter(context.Background(), prepared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			facade := &chatModel{delegate: delegate, config: prepared}
+			message, err := facade.Generate(context.Background(), []*schema.Message{schema.UserMessage("x")})
+			if message != nil || err == nil {
+				t.Fatalf("Generate = %#v, %v", message, err)
+			}
+			if errors.Is(err, einoproviders.ErrProviderAuth) != tt.wantAuth || errors.Is(err, einoproviders.ErrProviderAPI) != tt.wantAPI {
+				t.Fatalf("classification auth=%v api=%v: %v", errors.Is(err, einoproviders.ErrProviderAuth), errors.Is(err, einoproviders.ErrProviderAPI), err)
+			}
+			var httpErr *opencodeauth.HTTPError
+			if !errors.As(err, &httpErr) || httpErr.StatusCode != tt.status {
+				t.Fatalf("typed HTTP error = %#v", httpErr)
+			}
+			if strings.Contains(err.Error(), "secret-upstream-detail") {
+				t.Fatalf("error leaked upstream detail: %v", err)
 			}
 		})
 	}

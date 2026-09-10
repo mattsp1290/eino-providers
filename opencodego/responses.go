@@ -317,19 +317,19 @@ type responsesResponse struct {
 }
 
 type responsesUsage struct {
-	InputTokens         int                         `json:"input_tokens"`
-	OutputTokens        int                         `json:"output_tokens"`
-	TotalTokens         int                         `json:"total_tokens"`
+	InputTokens         *int                        `json:"input_tokens"`
+	OutputTokens        *int                        `json:"output_tokens"`
+	TotalTokens         *int                        `json:"total_tokens"`
 	InputTokensDetails  *responsesInputTokenDetails `json:"input_tokens_details"`
 	OutputTokensDetails *responsesOutputTokenDetail `json:"output_tokens_details"`
 }
 
 type responsesInputTokenDetails struct {
-	CachedTokens int `json:"cached_tokens"`
+	CachedTokens *int `json:"cached_tokens"`
 }
 
 type responsesOutputTokenDetail struct {
-	ReasoningTokens int `json:"reasoning_tokens"`
+	ReasoningTokens *int `json:"reasoning_tokens"`
 }
 
 type responsesOutputItem struct {
@@ -343,8 +343,8 @@ type responsesOutputItem struct {
 }
 
 type responsesOutputContentItem struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type string  `json:"type"`
+	Text *string `json:"text"`
 }
 
 func decodeResponsesResponse(body []byte) (*schema.Message, error) {
@@ -377,10 +377,10 @@ func decodeResponsesResponse(body []byte) (*schema.Message, error) {
 				return nil, responsesAPIFailure(errInvalidResponsesResponse)
 			}
 			for _, content := range item.Content {
-				if content.Type != "output_text" {
+				if content.Type != "output_text" || content.Text == nil {
 					return nil, responsesAPIFailure(errInvalidResponsesResponse)
 				}
-				text.WriteString(content.Text)
+				text.WriteString(*content.Text)
 			}
 		case "function_call":
 			if item.CallID == "" || strings.TrimSpace(item.Name) == "" || !json.Valid([]byte(item.Arguments)) {
@@ -422,7 +422,7 @@ func validateResponsesUsage(usage *responsesUsage) error {
 	if usage == nil {
 		return nil
 	}
-	values := []int{usage.InputTokens, usage.OutputTokens, usage.TotalTokens}
+	values := []*int{usage.InputTokens, usage.OutputTokens, usage.TotalTokens}
 	if usage.InputTokensDetails != nil {
 		values = append(values, usage.InputTokensDetails.CachedTokens)
 	}
@@ -430,7 +430,7 @@ func validateResponsesUsage(usage *responsesUsage) error {
 		values = append(values, usage.OutputTokensDetails.ReasoningTokens)
 	}
 	for _, value := range values {
-		if value < 0 {
+		if value == nil || *value < 0 {
 			return errInvalidResponsesResponse
 		}
 	}
@@ -441,12 +441,12 @@ func responsesTokenUsage(usage *responsesUsage) *schema.TokenUsage {
 	if usage == nil {
 		return nil
 	}
-	result := &schema.TokenUsage{PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.TotalTokens}
+	result := &schema.TokenUsage{PromptTokens: *usage.InputTokens, CompletionTokens: *usage.OutputTokens, TotalTokens: *usage.TotalTokens}
 	if usage.InputTokensDetails != nil {
-		result.PromptTokenDetails.CachedTokens = usage.InputTokensDetails.CachedTokens
+		result.PromptTokenDetails.CachedTokens = *usage.InputTokensDetails.CachedTokens
 	}
 	if usage.OutputTokensDetails != nil {
-		result.CompletionTokensDetails.ReasoningTokens = usage.OutputTokensDetails.ReasoningTokens
+		result.CompletionTokensDetails.ReasoningTokens = *usage.OutputTokensDetails.ReasoningTokens
 	}
 	return result
 }

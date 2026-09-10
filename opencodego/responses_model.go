@@ -69,7 +69,7 @@ func (m *responsesModel) Generate(ctx context.Context, input []*schema.Message, 
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		_ = response.Body.Close()
-		return nil, responsesAPIFailure(errResponsesNotCompleted)
+		return nil, safeFailure(operationGenerate, errResponsesNotCompleted)
 	}
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponsesBodyBytes+1))
 	closeErr := response.Body.Close()
