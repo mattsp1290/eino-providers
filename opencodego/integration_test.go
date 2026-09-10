@@ -212,8 +212,8 @@ func TestIntegrationTwoTurnParallelTools(t *testing.T) {
 				t.Fatal(err)
 			}
 			var replayed schema.Message
-			if err := json.Unmarshal(encoded, &replayed); err != nil {
-				t.Fatal(err)
+			if unmarshalErr := json.Unmarshal(encoded, &replayed); unmarshalErr != nil {
+				t.Fatal(unmarshalErr)
 			}
 			second, err := bound.Generate(context.Background(), []*schema.Message{
 				schema.UserMessage("weather and time"),
@@ -619,19 +619,21 @@ func (p integrationProtocol) generateResponse(text, usage string) string {
 	case "null":
 		usageJSON = `,"usage":null`
 	case "zero":
-		if p.protocol == opencodego.ProtocolMessages {
+		switch p.protocol {
+		case opencodego.ProtocolMessages:
 			usageJSON = `,"usage":{"input_tokens":0,"output_tokens":0}`
-		} else if p.protocol == opencodego.ProtocolChatCompletions {
+		case opencodego.ProtocolChatCompletions:
 			usageJSON = `,"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}`
-		} else {
+		default:
 			usageJSON = `,"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}`
 		}
 	case "nonzero":
-		if p.protocol == opencodego.ProtocolMessages {
+		switch p.protocol {
+		case opencodego.ProtocolMessages:
 			usageJSON = `,"usage":{"input_tokens":2,"output_tokens":1}`
-		} else if p.protocol == opencodego.ProtocolChatCompletions {
+		case opencodego.ProtocolChatCompletions:
 			usageJSON = `,"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}`
-		} else {
+		default:
 			usageJSON = `,"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}`
 		}
 	}
