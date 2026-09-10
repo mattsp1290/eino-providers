@@ -131,7 +131,7 @@ func (m *responsesModel) Stream(ctx context.Context, input []*schema.Message, op
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		cancel()
 		if closeErr := closeResponsesResponse(response); closeErr != nil {
-			return nil, responsesStreamFailure(closeErr)
+			return nil, responsesStreamFailure(operationStream, closeErr)
 		}
 		return nil, safeFailure(operationStream, errResponsesNotCompleted)
 	}
@@ -139,7 +139,7 @@ func (m *responsesModel) Stream(ctx context.Context, input []*schema.Message, op
 	if mediaErr != nil || mediaType != "text/event-stream" {
 		cancel()
 		if closeErr := closeResponsesResponse(response); closeErr != nil {
-			return nil, responsesStreamFailure(closeErr)
+			return nil, responsesStreamFailure(operationStream, closeErr)
 		}
 		return nil, responsesAPIFailure(errInvalidResponsesResponse)
 	}
@@ -163,15 +163,15 @@ func runResponsesStream(ctx context.Context, cancel context.CancelFunc, body io.
 		return
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		_ = writer.Send(nil, ctxErr)
+		_ = writer.Send(nil, responsesStreamFailure(operationReceive, ctxErr))
 		return
 	}
 	if parseErr != nil {
-		_ = writer.Send(nil, responsesStreamFailure(parseErr))
+		_ = writer.Send(nil, responsesStreamFailure(operationReceive, parseErr))
 		return
 	}
 	if closeErr != nil {
-		_ = writer.Send(nil, responsesStreamFailure(closeErr))
+		_ = writer.Send(nil, responsesStreamFailure(operationReceive, closeErr))
 		return
 	}
 	_ = writer.Send(terminal, nil)
@@ -203,14 +203,14 @@ func closeResponsesResponse(response *http.Response) error {
 	return closeResponsesStreamBody(response.Body)
 }
 
-func responsesStreamFailure(err error) error {
+func responsesStreamFailure(operation invocationOperation, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
+		return mapInvocationError(operation, err, nil)
 	}
 	if errors.Is(err, einoproviders.ErrProviderAPI) {
-		return err
+		return mapInvocationError(operation, err, nil)
 	}
-	return responsesAPIFailure(err)
+	return mapInvocationError(operation, responsesAPIFailure(err), nil)
 }
 
 func (m *responsesModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {

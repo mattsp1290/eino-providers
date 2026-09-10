@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 
 	einoproviders "github.com/mattsp1290/eino-providers"
@@ -155,7 +156,7 @@ func TestResponsesStreamHonorsContextAndConsumerClosure(t *testing.T) {
 	}
 }
 
-func TestResponsesModelStreamAuthenticatesAndStopsAtTerminal(t *testing.T) {
+func TestChatModelResponsesStreamAuthenticatesAndStopsAtTerminal(t *testing.T) {
 	serverReleased := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer close(serverReleased)
@@ -202,7 +203,7 @@ func TestResponsesModelStreamAuthenticatesAndStopsAtTerminal(t *testing.T) {
 	}
 }
 
-func TestResponsesModelStreamDeliversTextBeforeCompletion(t *testing.T) {
+func TestChatModelResponsesStreamDeliversTextBeforeCompletion(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
@@ -263,7 +264,7 @@ func TestResponsesModelStreamDeliversTextBeforeCompletion(t *testing.T) {
 
 func TestResponsesModelStreamCancellationClosesBlockedBody(t *testing.T) {
 	body := newBlockingResponsesBody()
-	model := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body))
+	model := newPublicResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body))
 	ctx, cancel := context.WithCancel(context.Background())
 	stream, err := model.Stream(ctx, []*schema.Message{schema.UserMessage("x")})
 	if err != nil {
@@ -274,6 +275,9 @@ func TestResponsesModelStreamCancellationClosesBlockedBody(t *testing.T) {
 	stream.Close()
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Recv error = %v", err)
+	}
+	if err.Error() != "opencode-go: receive failed" {
+		t.Fatalf("Recv error label = %q", err)
 	}
 	select {
 	case <-body.closed:
@@ -291,7 +295,7 @@ func TestResponsesModelStreamReaderCloseReleasesBlockedProducer(t *testing.T) {
 		events = append(events, `{"type":"response.output_text.delta","output_index":0,"delta":"x"}`)
 	}
 	body := &trackedBody{Reader: strings.NewReader(responsesSSE(events...))}
-	stream, err := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+	stream, err := newPublicResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,13 +313,13 @@ func TestResponsesModelStreamReaderCloseReleasesBlockedProducer(t *testing.T) {
 func TestResponsesModelStreamContainsBodyPanics(t *testing.T) {
 	t.Run("read", func(t *testing.T) {
 		body := &panicResponsesBody{canary: "secret-read-panic"}
-		stream, err := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+		stream, err := newPublicResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer stream.Close()
 		_, err = stream.Recv()
-		if !errors.Is(err, einoproviders.ErrProviderAPI) || strings.Contains(err.Error(), body.canary) {
+		if !errors.Is(err, einoproviders.ErrProviderAPI) || err.Error() != "opencode-go: receive failed" || strings.Contains(err.Error(), body.canary) {
 			t.Fatalf("panic error = %v", err)
 		}
 		if body.closeCount() != 1 {
@@ -324,19 +328,35 @@ func TestResponsesModelStreamContainsBodyPanics(t *testing.T) {
 	})
 	t.Run("close", func(t *testing.T) {
 		body := &panicCloseResponsesBody{Reader: strings.NewReader(responsesSSE(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)), canary: "secret-close-panic"}
-		stream, err := newDirectResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+		stream, err := newPublicResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer stream.Close()
 		_, err = stream.Recv()
-		if !errors.Is(err, einoproviders.ErrProviderAPI) || strings.Contains(err.Error(), body.canary) {
+		if !errors.Is(err, einoproviders.ErrProviderAPI) || err.Error() != "opencode-go: receive failed" || strings.Contains(err.Error(), body.canary) {
 			t.Fatalf("panic error = %v", err)
 		}
 		if body.closeCount() != 1 {
 			t.Fatalf("close count = %d", body.closeCount())
 		}
 	})
+}
+
+func TestChatModelResponsesStreamMapsMalformedEventAsReceiveFailure(t *testing.T) {
+	body := &trackedBody{Reader: strings.NewReader(responsesSSE(`{"type":"response.failed","response":{"error":{"message":"secret-event"}}}`))}
+	stream, err := newPublicResponsesModel(t, responsesHTTPClient(http.StatusOK, "text/event-stream", body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	_, err = stream.Recv()
+	if !errors.Is(err, einoproviders.ErrProviderAPI) {
+		t.Fatalf("Recv error classification = %v", err)
+	}
+	if err.Error() != "opencode-go: receive failed" || strings.Contains(err.Error(), "secret-event") {
+		t.Fatalf("Recv error = %v", err)
+	}
 }
 
 func TestResponsesModelStreamRejectsInvalidHTTPResponseAndClosesBody(t *testing.T) {
@@ -347,7 +367,7 @@ func TestResponsesModelStreamRejectsInvalidHTTPResponseAndClosesBody(t *testing.
 		body        io.ReadCloser
 		wantAPI     bool
 	}{
-		{name: "status", status: http.StatusInternalServerError, contentType: "text/event-stream"},
+		{name: "status", status: http.StatusInternalServerError, contentType: "text/event-stream", wantAPI: true},
 		{name: "content type", status: http.StatusOK, contentType: "application/json", wantAPI: true},
 		{name: "close panic", status: http.StatusOK, contentType: "application/json", body: &panicCloseResponsesBody{Reader: strings.NewReader("secret response"), canary: "secret-close-panic"}, wantAPI: true},
 	}
@@ -357,7 +377,7 @@ func TestResponsesModelStreamRejectsInvalidHTTPResponseAndClosesBody(t *testing.
 			if body == nil {
 				body = &trackedBody{Reader: strings.NewReader("secret response")}
 			}
-			_, err := newDirectResponsesModel(t, responsesHTTPClient(tt.status, tt.contentType, body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
+			_, err := newPublicResponsesModel(t, responsesHTTPClient(tt.status, tt.contentType, body)).Stream(context.Background(), []*schema.Message{schema.UserMessage("x")})
 			if err == nil || (tt.wantAPI && !errors.Is(err, einoproviders.ErrProviderAPI)) || strings.Contains(err.Error(), "secret") {
 				t.Fatalf("Stream error = %v", err)
 			}
@@ -393,20 +413,28 @@ func receiveResponsesChunks(stream *schema.StreamReader[*schema.Message]) ([]*sc
 	}
 }
 
-func newResponsesModelAtServer(t *testing.T, server *httptest.Server) *responsesModel {
+func newResponsesModelAtServer(t *testing.T, server *httptest.Server) model.ToolCallingChatModel {
 	t.Helper()
-	prepared, err := prepareConfig(ChatModelConfig{
+	adapter, err := NewChatModel(context.Background(), ChatModelConfig{
 		Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "responses-stream-test/1",
 		SessionID: "session", BaseURL: server.URL + "/v1", HTTPClient: server.Client(),
-	}, chatModelConstruction)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter, err := newResponsesAdapter(context.Background(), prepared)
+	return adapter
+}
+
+func newPublicResponsesModel(t *testing.T, client *http.Client) model.ToolCallingChatModel {
+	t.Helper()
+	adapter, err := NewChatModel(context.Background(), ChatModelConfig{
+		Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "responses-stream-test/1",
+		SessionID: "session", BaseURL: "https://api.example.test/v1", HTTPClient: client,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return adapter.(*responsesModel)
+	return adapter
 }
 
 type blockingResponsesBody struct {

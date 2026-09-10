@@ -21,8 +21,7 @@ type chatModel struct {
 var _ model.ToolCallingChatModel = (*chatModel)(nil)
 
 // NewChatModel constructs an OpenCode Go model without performing network or
-// filesystem I/O. The selected protocol is explicit; adapters that have not
-// landed return an initialization error.
+// filesystem I/O. The selected protocol is explicit.
 func NewChatModel(ctx context.Context, cfg ChatModelConfig) (model.ToolCallingChatModel, error) {
 	prepared, err := prepareConfig(cfg, chatModelConstruction)
 	if err != nil {
@@ -32,10 +31,6 @@ func NewChatModel(ctx context.Context, cfg ChatModelConfig) (model.ToolCallingCh
 }
 
 func newChatModelFromPrepared(ctx context.Context, cfg preparedConfig) (*chatModel, error) {
-	if !protocolImplemented(cfg.protocol) {
-		_, err := newProtocolAdapter(ctx, cfg)
-		return nil, einoproviders.WrapInitError(err)
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -66,6 +61,9 @@ func (m *chatModel) generate(ctx context.Context, input []*schema.Message, opera
 	if message == nil {
 		return nil, mapInvocationError(operation, errNilSuccessfulMessage, state)
 	}
+	if m.config.protocol == ProtocolResponses {
+		return message, nil
+	}
 	if err := normalizeGeneratedUsage(message, state); err != nil {
 		return nil, mapInvocationError(operation, err, state)
 	}
@@ -81,6 +79,9 @@ func (m *chatModel) Stream(ctx context.Context, input []*schema.Message, opts ..
 	stream, err := m.delegate.Stream(opCtx, input, preparedOpts...)
 	if err != nil {
 		return nil, mapInvocationError(operationStream, err, state)
+	}
+	if m.config.protocol == ProtocolResponses {
+		return stream, nil
 	}
 	return normalizeObservedStream(opCtx, stream, state), nil
 }

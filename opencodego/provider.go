@@ -33,10 +33,6 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		if !protocolImplemented(prepared.protocol) {
-			_, unsupported := newProtocolAdapter(context.Background(), prepared)
-			return nil, einoproviders.WrapInitError(unsupported)
-		}
 		return &Provider{config: prepared}, nil
 	})
 }
