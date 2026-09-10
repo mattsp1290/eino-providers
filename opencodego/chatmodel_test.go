@@ -333,10 +333,83 @@ func TestChatModelValidatesOptionsAndMapsHTTPError(t *testing.T) {
 	}
 }
 
+func TestChatModelMessagesGenerateUsesNativeEndpoint(t *testing.T) {
+	var request struct {
+		Model     string           `json:"model"`
+		MaxTokens int              `json:"max_tokens"`
+		Messages  []map[string]any `json:"messages"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/custom/root/messages"; got != want {
+			t.Errorf("path = %q, want %q", got, want)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "real-key" {
+			t.Errorf("X-Api-Key = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want empty", got)
+		}
+		if got := r.Header.Get("X-OpenCode-Session"); got != "messages-session" {
+			t.Errorf("session = %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_fixture","type":"message","role":"assistant",
+			"content":[{"type":"text","text":"messages answer"}],
+			"model":"fixture-model","stop_reason":"end_turn","stop_sequence":null,
+			"usage":{"input_tokens":4,"output_tokens":2}
+		}`))
+	}))
+	t.Cleanup(server.Close)
+	cap := 19
+	cm, err := NewChatModel(context.Background(), ChatModelConfig{
+		Model: "fixture-model", Protocol: ProtocolMessages, APIKey: "real-key", UserAgent: "messages-test/1",
+		SessionID: "messages-session", BaseURL: server.URL + "/custom/root", HTTPClient: server.Client(), MaxTokens: &cap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := cm.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Content != "messages answer" {
+		t.Fatalf("content = %q", message.Content)
+	}
+	if request.Model != "fixture-model" || request.MaxTokens != cap || len(request.Messages) != 1 {
+		t.Fatalf("request = %#v", request)
+	}
+}
+
+func TestChatModelMessagesMapsHTTPError(t *testing.T) {
+	secret := "messages-upstream-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"` + secret + `"}}`))
+	}))
+	t.Cleanup(server.Close)
+	cap := 8
+	cm, err := NewChatModel(context.Background(), ChatModelConfig{
+		Model: "fixture-model", Protocol: ProtocolMessages, APIKey: "real-key", UserAgent: "messages-test/1",
+		SessionID: "messages-session", BaseURL: server.URL + "/custom/root", HTTPClient: server.Client(), MaxTokens: &cap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cm.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+	if !errors.Is(err, einoproviders.ErrProviderAuth) {
+		t.Fatalf("Generate error = %v, want ErrProviderAuth", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("Generate error leaked upstream detail: %v", err)
+	}
+}
+
 func TestNewChatModelRejectsUnavailableProtocols(t *testing.T) {
-	cap := 10
 	for _, cfg := range []ChatModelConfig{
-		{Model: "fixture", Protocol: ProtocolMessages, APIKey: "key", UserAgent: "test/1", MaxTokens: &cap},
 		{Model: "fixture", Protocol: ProtocolResponses, APIKey: "key", UserAgent: "test/1"},
 	} {
 		if _, err := NewChatModel(context.Background(), cfg); !errors.Is(err, einoproviders.ErrProviderInit) {

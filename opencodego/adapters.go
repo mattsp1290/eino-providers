@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 
+	claudeadapter "github.com/cloudwego/eino-ext/components/model/claude"
 	openaiadapter "github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -17,7 +18,7 @@ import (
 const sdkValidationPlaceholder = "opencode-go-sdk-placeholder"
 
 func protocolImplemented(protocol Protocol) bool {
-	return protocol == ProtocolChatCompletions
+	return protocol == ProtocolChatCompletions || protocol == ProtocolMessages
 }
 
 // cloneTools converts parameter descriptions into an owned JSON Schema. The
@@ -63,12 +64,33 @@ func newProtocolAdapter(ctx context.Context, cfg preparedConfig) (model.ToolCall
 	case ProtocolChatCompletions:
 		return newChatCompletionsAdapter(ctx, cfg)
 	case ProtocolMessages:
-		return nil, fmt.Errorf("opencodego: Messages adapter is not available")
+		return newMessagesAdapter(ctx, cfg)
 	case ProtocolResponses:
 		return nil, fmt.Errorf("opencodego: Responses adapter is not available")
 	default:
 		return nil, fmt.Errorf("opencodego: unsupported Protocol %q", cfg.protocol)
 	}
+}
+
+func newMessagesAdapter(ctx context.Context, cfg preparedConfig) (model.ToolCallingChatModel, error) {
+	if cfg.maxTokens == nil {
+		return nil, mapConstructorError(fmt.Errorf("opencodego: MaxTokens is required for Messages"))
+	}
+	httpClient, sdkBaseURL, err := newMessagesHTTPClient(cfg.authClient)
+	if err != nil {
+		return nil, err
+	}
+	delegate, err := claudeadapter.NewChatModel(ctx, &claudeadapter.Config{
+		APIKey:     sdkValidationPlaceholder,
+		BaseURL:    &sdkBaseURL,
+		HTTPClient: httpClient,
+		Model:      cfg.model,
+		MaxTokens:  *cfg.maxTokens,
+	})
+	if err != nil {
+		return nil, mapConstructorError(err)
+	}
+	return delegate, nil
 }
 
 func newChatCompletionsAdapter(ctx context.Context, cfg preparedConfig) (model.ToolCallingChatModel, error) {
