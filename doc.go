@@ -1,5 +1,5 @@
 // Package einoproviders provides shared CloudWeGo Eino provider construction
-// for agentic applications.
+// for agentic applications, including the opt-in OpenCode Go backend.
 //
 // The root package defines the single-shot Provider contract, common Options,
 // usage extraction, error classification, and a registry-backed NewProvider
@@ -11,10 +11,11 @@
 //	import (
 //		einoproviders "github.com/mattsp1290/eino-providers"
 //		_ "github.com/mattsp1290/eino-providers/claude"
+//		_ "github.com/mattsp1290/eino-providers/opencodego"
 //	)
 //
 // The root package intentionally does not import backend subpackages. This keeps
-// backend SDKs and Codex OAuth dependencies opt-in.
+// backend SDKs, Codex OAuth, and OpenCode Go authentication dependencies opt-in.
 //
 // RegisterProvider is public so backend packages can self-register and tests can
 // install local constructors. Direct third-party registration should be treated
