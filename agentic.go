@@ -291,6 +291,9 @@ func validateStreamAgenticContentBlocks(message *schema.AgenticMessage, limits A
 			}
 			seen[block.StreamingMeta.Index] = struct{}{}
 		}
+		if err := validateInlineMediaBlock(block, limits); err != nil {
+			return err
+		}
 		*count = *count + 1
 		if *count > limits.MaxContentBlocks {
 			return &ResourceLimitError{Resource: "content_blocks", Limit: int64(limits.MaxContentBlocks), Actual: int64(*count)}
@@ -311,12 +314,99 @@ func ValidateAgenticContentBlocks(messages []*schema.AgenticMessage, limits Agen
 		if message == nil {
 			continue
 		}
-		count += len(message.ContentBlocks)
-		if count > resolved.MaxContentBlocks {
-			return &ResourceLimitError{Resource: "content_blocks", Limit: int64(resolved.MaxContentBlocks), Actual: int64(count)}
+		for _, block := range message.ContentBlocks {
+			if block == nil {
+				continue
+			}
+			count++
+			if count > resolved.MaxContentBlocks {
+				return &ResourceLimitError{Resource: "content_blocks", Limit: int64(resolved.MaxContentBlocks), Actual: int64(count)}
+			}
+			if err := validateInlineMediaBlock(block, resolved); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func validateInlineMediaBlock(block *schema.ContentBlock, limits AgenticLimits) error {
+	if block == nil {
+		return nil
+	}
+	media := make([]string, 0, 6)
+	if value := block.UserInputImage; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if value := block.UserInputAudio; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if value := block.UserInputVideo; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if value := block.UserInputFile; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if value := block.AssistantGenImage; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if value := block.AssistantGenAudio; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if value := block.AssistantGenVideo; value != nil {
+		media = append(media, value.Base64Data)
+	}
+	if result := block.FunctionToolResult; result != nil {
+		for _, content := range result.Content {
+			if content.Image != nil {
+				media = append(media, content.Image.Base64Data)
+			}
+			if content.Audio != nil {
+				media = append(media, content.Audio.Base64Data)
+			}
+			if content.Video != nil {
+				media = append(media, content.Video.Base64Data)
+			}
+			if content.File != nil {
+				media = append(media, content.File.Base64Data)
+			}
+		}
+	}
+	for _, encoded := range media {
+		if decoded := decodedBase64Size(encoded); decoded > limits.MaxInlineMediaBytes {
+			return &ResourceLimitError{Resource: "inline_media_bytes", Limit: limits.MaxInlineMediaBytes, Actual: decoded}
+		}
+	}
+	return nil
+}
+
+func decodedBase64Size(encoded string) int64 {
+	if encoded == "" {
+		return 0
+	}
+	length := len(encoded)
+	padding := 0
+	if encoded[length-1] == '=' {
+		padding++
+	}
+	if length > 1 && encoded[length-2] == '=' {
+		padding++
+	}
+	if padding != 0 {
+		return int64((length/4)*3 - padding)
+	}
+	decoded := (length / 4) * 3
+	switch length % 4 {
+	case 2:
+		decoded++
+	case 3:
+		decoded += 2
+	case 1:
+		// Invalid encodings are rejected later by the provider codec. Count a
+		// conservative upper bound here so they cannot bypass this boundary.
+		decoded++
+	}
+	return int64(decoded)
 }
 
 // WithDefaults returns limits with every zero field replaced by its default.

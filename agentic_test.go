@@ -24,7 +24,7 @@ func TestAgenticLimitsDefaultsAndValidation(t *testing.T) {
 }
 
 func TestValidateAgenticContentBlocksRejectsOverLimit(t *testing.T) {
-	messages := []*schema.AgenticMessage{{ContentBlocks: make([]*schema.ContentBlock, 2)}}
+	messages := []*schema.AgenticMessage{{ContentBlocks: []*schema.ContentBlock{{}, {}}}}
 	err := ValidateAgenticContentBlocks(messages, AgenticLimits{MaxContentBlocks: 1})
 	if !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("error = %v", err)
@@ -64,5 +64,13 @@ func TestStreamContentBlockLimitCountsUniqueStreamingIndexes(t *testing.T) {
 	}
 	if err := validateStreamAgenticContentBlocks(&schema.AgenticMessage{ContentBlocks: []*schema.ContentBlock{{StreamingMeta: &schema.StreamingMeta{Index: 1}}}}, limits, seen, &count); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("second indexed block error = %v", err)
+	}
+}
+
+func TestValidateAgenticContentBlocksRejectsOversizeInlineMedia(t *testing.T) {
+	message := &schema.AgenticMessage{ContentBlocks: []*schema.ContentBlock{{UserInputImage: &schema.UserInputImage{Base64Data: "YWJj"}}}}
+	err := ValidateAgenticContentBlocks([]*schema.AgenticMessage{message}, AgenticLimits{MaxInlineMediaBytes: 2})
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("error = %v", err)
 	}
 }
