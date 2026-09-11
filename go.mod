@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/cloudwego/eino v0.9.19
+	github.com/cloudwego/eino-ext/components/model/agenticgemini v0.2.3
 	github.com/cloudwego/eino-ext/components/model/agenticopenai v0.2.2
 	github.com/cloudwego/eino-ext/components/model/claude v0.1.17
 	github.com/cloudwego/eino-ext/components/model/gemini v0.1.30
