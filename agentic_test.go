@@ -48,3 +48,21 @@ func TestSplitRestoreAgenticContinuationDoesNotMutatePublicMessage(t *testing.T)
 		t.Fatalf("restored extra = %#v", restored.Extra)
 	}
 }
+
+func TestStreamContentBlockLimitCountsUniqueStreamingIndexes(t *testing.T) {
+	limits, err := (AgenticLimits{MaxContentBlocks: 1}).Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen, count := map[int]struct{}{}, 0
+	chunk := &schema.AgenticMessage{ContentBlocks: []*schema.ContentBlock{
+		{StreamingMeta: &schema.StreamingMeta{Index: 0}},
+		{StreamingMeta: &schema.StreamingMeta{Index: 0}},
+	}}
+	if err := validateStreamAgenticContentBlocks(chunk, limits, seen, &count); err != nil {
+		t.Fatalf("same-index stream chunks = %v", err)
+	}
+	if err := validateStreamAgenticContentBlocks(&schema.AgenticMessage{ContentBlocks: []*schema.ContentBlock{{StreamingMeta: &schema.StreamingMeta{Index: 1}}}}, limits, seen, &count); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("second indexed block error = %v", err)
+	}
+}

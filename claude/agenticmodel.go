@@ -60,7 +60,7 @@ func NewAgenticModel(_ context.Context, cfg AgenticModelConfig) (model.AgenticMo
 	if base == "" {
 		base = "https://api.anthropic.com"
 	}
-	return &agenticModel{baseURL: base, model: cfg.Model, apiKey: cfg.APIKey, maxTokens: cfg.MaxTokens, client: client, limits: limits}, nil
+	return einoproviders.NewBoundedAgenticModel(&agenticModel{baseURL: base, model: cfg.Model, apiKey: cfg.APIKey, maxTokens: cfg.MaxTokens, client: client, limits: limits}, limits)
 }
 
 func (m *agenticModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {

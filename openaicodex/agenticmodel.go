@@ -74,7 +74,7 @@ func NewAgenticModelWithHTTPClient(_ context.Context, client *http.Client, cfg A
 		m.reasoning = &reasoningParam{Effort: effort, Summary: "auto"}
 		m.include = []string{"reasoning.encrypted_content"}
 	}
-	return m, nil
+	return einoproviders.NewBoundedAgenticModel(m, limits)
 }
 
 func (m *agenticModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {

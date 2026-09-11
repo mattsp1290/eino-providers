@@ -267,12 +267,36 @@ func (m *boundedAgenticModel) Stream(ctx context.Context, input []*schema.Agenti
 	if err != nil {
 		return nil, err
 	}
+	seen := make(map[int]struct{})
+	count := 0
 	return schema.StreamReaderWithConvert(stream, func(message *schema.AgenticMessage) (*schema.AgenticMessage, error) {
-		if err := ValidateAgenticContentBlocks([]*schema.AgenticMessage{message}, m.limits); err != nil {
+		if err := validateStreamAgenticContentBlocks(message, m.limits, seen, &count); err != nil {
 			return nil, err
 		}
 		return message, nil
 	}), nil
+}
+
+func validateStreamAgenticContentBlocks(message *schema.AgenticMessage, limits AgenticLimits, seen map[int]struct{}, count *int) error {
+	if message == nil {
+		return nil
+	}
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		if block.StreamingMeta != nil {
+			if _, exists := seen[block.StreamingMeta.Index]; exists {
+				continue
+			}
+			seen[block.StreamingMeta.Index] = struct{}{}
+		}
+		*count = *count + 1
+		if *count > limits.MaxContentBlocks {
+			return &ResourceLimitError{Resource: "content_blocks", Limit: int64(limits.MaxContentBlocks), Actual: int64(*count)}
+		}
+	}
+	return nil
 }
 
 // ValidateAgenticContentBlocks rejects a message collection whose total block

@@ -65,7 +65,7 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if err := pingWithCappedTimeout(ctx, cfg.BaseURL, client, cfg.Timeout); err != nil {
 		return nil, err
 	}
-	return &agenticModel{baseURL: strings.TrimRight(cfg.BaseURL, "/"), model: cfg.Model, client: client, think: cfg.Thinking, keepAlive: strings.TrimSpace(cfg.KeepAlive), limits: limits}, nil
+	return einoproviders.NewBoundedAgenticModel(&agenticModel{baseURL: strings.TrimRight(cfg.BaseURL, "/"), model: cfg.Model, client: client, think: cfg.Thinking, keepAlive: strings.TrimSpace(cfg.KeepAlive), limits: limits}, limits)
 }
 
 func (m *agenticModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
