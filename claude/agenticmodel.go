@@ -56,6 +56,10 @@ func NewAgenticModel(_ context.Context, cfg AgenticModelConfig) (model.AgenticMo
 	if client == nil {
 		client = &http.Client{Timeout: cfg.Timeout}
 	}
+	client, err = einoproviders.NewAgenticLimitedHTTPClient(client, limits)
+	if err != nil {
+		return nil, einoproviders.WrapInitError(fmt.Errorf("claude: build agentic limited client: %w", err))
+	}
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base == "" {
 		base = "https://api.anthropic.com"

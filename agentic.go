@@ -104,7 +104,8 @@ func RestoreAgenticContinuationForProvider(public *schema.AgenticMessage, state 
 	if state.Provider != provider || state.Protocol != protocol || state.Version != agenticContinuationVersion {
 		return nil, fmt.Errorf("%s: incompatible agentic continuation state", provider)
 	}
-	if correlationID := continuationCorrelationID(public); state.CorrelationID != "" && correlationID != "" && state.CorrelationID != correlationID {
+	identity, hasIdentity := continuationIdentity(public)
+	if state.CorrelationID != "" && (!hasIdentity || identity.CorrelationID != state.CorrelationID) {
 		return nil, fmt.Errorf("%s: continuation correlation mismatch", provider)
 	}
 	var payload agenticContinuationPayload
@@ -117,6 +118,9 @@ func RestoreAgenticContinuationForProvider(public *schema.AgenticMessage, state 
 	restored, err := cloneAgenticMessageForContinuation(public)
 	if err != nil {
 		return nil, err
+	}
+	if hasIdentity && restored.ResponseMeta != nil {
+		restored.ResponseMeta.Extension = identity
 	}
 	restored.Extra, err = unmarshalContinuationExtra(payload.MessageExtra)
 	if err != nil {
@@ -182,17 +186,43 @@ func unmarshalContinuationExtra(extra map[string]json.RawMessage) (map[string]an
 }
 
 func continuationCorrelationID(msg *schema.AgenticMessage) string {
-	if msg == nil || msg.ResponseMeta == nil {
+	identity, ok := continuationIdentity(msg)
+	if !ok {
 		return ""
+	}
+	return identity.CorrelationID
+}
+
+func continuationIdentity(msg *schema.AgenticMessage) (AgenticResponseIdentity, bool) {
+	if msg == nil || msg.ResponseMeta == nil {
+		return AgenticResponseIdentity{}, false
 	}
 	switch extension := msg.ResponseMeta.Extension.(type) {
 	case AgenticResponseIdentity:
-		return extension.CorrelationID
+		return extension, true
 	case AgenticResponseMetadata:
-		return extension.Identity.CorrelationID
+		return extension.Identity, true
+	case map[string]any:
+		if nested, ok := extension["identity"].(map[string]any); ok {
+			return identityFromMap(nested)
+		}
+		return identityFromMap(extension)
 	default:
-		return ""
+		return AgenticResponseIdentity{}, false
 	}
+}
+
+func identityFromMap(values map[string]any) (AgenticResponseIdentity, bool) {
+	provider, providerOK := values["provider"].(string)
+	protocol, protocolOK := values["protocol"].(string)
+	if !providerOK || !protocolOK {
+		return AgenticResponseIdentity{}, false
+	}
+	identity := AgenticResponseIdentity{Provider: provider, Protocol: protocol}
+	identity.RequestedModel, _ = values["requested_model"].(string)
+	identity.ReturnedModel, _ = values["returned_model"].(string)
+	identity.CorrelationID, _ = values["correlation_id"].(string)
+	return identity, true
 }
 
 const (

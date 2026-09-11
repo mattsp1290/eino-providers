@@ -62,6 +62,10 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if client == nil {
 		client = &http.Client{Timeout: cfg.Timeout}
 	}
+	client, err = einoproviders.NewAgenticLimitedHTTPClient(client, limits)
+	if err != nil {
+		return nil, einoproviders.WrapInitError(fmt.Errorf("ollama: build agentic limited client: %w", err))
+	}
 	if err := pingWithCappedTimeout(ctx, cfg.BaseURL, client, cfg.Timeout); err != nil {
 		return nil, err
 	}

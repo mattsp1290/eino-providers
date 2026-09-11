@@ -65,6 +65,10 @@ func NewAgenticModelWithHTTPClient(_ context.Context, client *http.Client, cfg A
 	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("openai-codex: invalid agentic limits: %w", err))
 	}
+	client, err = einoproviders.NewAgenticLimitedHTTPClient(client, limits)
+	if err != nil {
+		return nil, einoproviders.WrapInitError(fmt.Errorf("openai-codex: build agentic limited client: %w", err))
+	}
 	m := &agenticModel{httpClient: client, model: cfg.Model, include: []string{}, limits: limits}
 	if !cfg.DisableReasoning {
 		effort := cfg.ReasoningEffort

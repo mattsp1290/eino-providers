@@ -50,4 +50,11 @@ func TestAgenticContinuationSeparatesPrivateState(t *testing.T) {
 	if restored.ContentBlocks[0].Reasoning.Signature != "encrypted-secret" || restored.Extra["private"] != "cache-secret" {
 		t.Fatalf("restored state = %#v", restored)
 	}
+	if _, ok := restored.ResponseMeta.Extension.(einoproviders.AgenticResponseIdentity); !ok {
+		t.Fatalf("restored identity type = %T", restored.ResponseMeta.Extension)
+	}
+	reopenedPublic.ResponseMeta.Extension = map[string]any{"provider": "openai", "protocol": "responses", "correlation_id": "substituted"}
+	if _, err := RestoreAgenticContinuation(reopenedPublic, reopenedState); err == nil || !strings.Contains(err.Error(), "correlation") {
+		t.Fatalf("substituted public message error = %v", err)
+	}
 }
