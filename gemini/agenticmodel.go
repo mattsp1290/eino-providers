@@ -3,6 +3,7 @@ package gemini
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	agenticgemini "github.com/cloudwego/eino-ext/components/model/agenticgemini"
 	"github.com/cloudwego/eino/components/model"
@@ -21,6 +22,7 @@ type AgenticModelConfig struct {
 	Temperature *float32
 	TopP        *float32
 	TopK        *int32
+	HTTPClient  *http.Client
 	Limits      einoproviders.AgenticLimits
 }
 
@@ -30,13 +32,17 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if cfg.Model == "" {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: Model is required"))
 	}
-	if _, err := cfg.Limits.Validate(); err != nil {
+	limits, err := cfg.Limits.Validate()
+	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: invalid agentic limits: %w", err))
 	}
 	client := cfg.Client
 	if client == nil {
-		var err error
-		client, err = genai.NewClient(ctx, &genai.ClientConfig{APIKey: cfg.APIKey})
+		httpClient, err := einoproviders.NewAgenticLimitedHTTPClient(cfg.HTTPClient, limits)
+		if err != nil {
+			return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: build agentic limited client: %w", err))
+		}
+		client, err = genai.NewClient(ctx, &genai.ClientConfig{APIKey: cfg.APIKey, HTTPClient: httpClient})
 		if err != nil {
 			return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: build agentic client: %w", err))
 		}
@@ -45,7 +51,11 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: build agentic model %q: %w", cfg.Model, err))
 	}
-	return &geminiAgenticModel{delegate: m}, nil
+	bounded, err := einoproviders.NewBoundedAgenticModel(m, limits)
+	if err != nil {
+		return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: bound agentic model: %w", err))
+	}
+	return &geminiAgenticModel{delegate: bounded}, nil
 }
 
 type geminiAgenticModel struct{ delegate model.AgenticModel }

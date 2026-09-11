@@ -104,22 +104,30 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 		if err != nil {
 			return nil, err
 		}
+		httpClient, err = einoproviders.NewAgenticLimitedHTTPClient(httpClient, limits)
+		if err != nil {
+			return nil, mapConstructorError(err)
+		}
 		zero := 0
 		m, err := agenticopenai.NewResponsesModel(ctx, &agenticopenai.ResponsesConfig{APIKey: sdkValidationPlaceholder, BaseURL: prepared.authClient.BaseURL(), HTTPClient: httpClient, Model: prepared.model, MaxTokens: prepared.maxTokens, MaxRetries: &zero})
 		if err != nil {
 			return nil, mapConstructorError(err)
 		}
-		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "responses", model: prepared.model, limits: limits}, nil
+		return newBoundedOpenCodeAgenticModel(m, "responses", prepared.model, limits)
 	case ProtocolChatCompletions:
 		httpClient, err := newObservedHTTPClient(prepared.authClient)
 		if err != nil {
 			return nil, err
 		}
+		httpClient, err = einoproviders.NewAgenticLimitedHTTPClient(httpClient, limits)
+		if err != nil {
+			return nil, mapConstructorError(err)
+		}
 		m, err := agenticopenai.NewChatModel(ctx, &agenticopenai.ChatConfig{APIKey: sdkValidationPlaceholder, BaseURL: prepared.authClient.BaseURL(), HTTPClient: httpClient, Model: prepared.model, MaxCompletionTokens: prepared.maxTokens})
 		if err != nil {
 			return nil, mapConstructorError(err)
 		}
-		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "chat_completions", model: prepared.model, limits: limits}, nil
+		return newBoundedOpenCodeAgenticModel(m, "chat_completions", prepared.model, limits)
 	case ProtocolMessages:
 		if prepared.maxTokens == nil {
 			return nil, mapConstructorError(fmt.Errorf("opencodego: MaxTokens is required for Messages"))
@@ -128,12 +136,24 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 		if err != nil {
 			return nil, err
 		}
+		httpClient, err = einoproviders.NewAgenticLimitedHTTPClient(httpClient, limits)
+		if err != nil {
+			return nil, mapConstructorError(err)
+		}
 		m, err := providerclaude.NewAgenticModel(ctx, providerclaude.AgenticModelConfig{Model: prepared.model, MaxTokens: *prepared.maxTokens, BaseURL: baseURL, HTTPClient: httpClient, Limits: limits})
 		if err != nil {
 			return nil, err
 		}
-		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "messages", model: prepared.model, limits: limits}, nil
+		return newBoundedOpenCodeAgenticModel(m, "messages", prepared.model, limits)
 	default:
 		return nil, mapConstructorError(fmt.Errorf("opencodego: unsupported Protocol %q", prepared.protocol))
 	}
+}
+
+func newBoundedOpenCodeAgenticModel(delegate model.AgenticModel, protocol, modelName string, limits einoproviders.AgenticLimits) (model.AgenticModel, error) {
+	bounded, err := einoproviders.NewBoundedAgenticModel(delegate, limits)
+	if err != nil {
+		return nil, mapConstructorError(err)
+	}
+	return &openCodeAgenticModel{delegate: bounded, provider: "opencodego", protocol: protocol, model: modelName, limits: limits}, nil
 }

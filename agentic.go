@@ -1,6 +1,12 @@
 package einoproviders
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+
+	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/schema"
+)
 
 // AgenticResponseIdentity records the provider identity observed for a native
 // agentic response. RequestedModel and ReturnedModel are deliberately kept
@@ -63,6 +69,75 @@ type AgenticLimits struct {
 	MaxContentBlocks       int
 	MaxErrorBodyBytes      int64
 	MaxFixtureCaptureBytes int64
+}
+
+// NewBoundedAgenticModel adds pre-dispatch and returned-message content-block
+// validation to a native model. It complements the HTTP limiter, which owns
+// byte boundaries at the transport layer.
+func NewBoundedAgenticModel(delegate model.AgenticModel, limits AgenticLimits) (model.AgenticModel, error) {
+	if delegate == nil {
+		return nil, fmt.Errorf("agentic delegate is required")
+	}
+	resolved, err := limits.Validate()
+	if err != nil {
+		return nil, err
+	}
+	return &boundedAgenticModel{delegate: delegate, limits: resolved}, nil
+}
+
+type boundedAgenticModel struct {
+	delegate model.AgenticModel
+	limits   AgenticLimits
+}
+
+func (m *boundedAgenticModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
+	if err := ValidateAgenticContentBlocks(input, m.limits); err != nil {
+		return nil, err
+	}
+	result, err := m.delegate.Generate(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateAgenticContentBlocks([]*schema.AgenticMessage{result}, m.limits); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (m *boundedAgenticModel) Stream(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.StreamReader[*schema.AgenticMessage], error) {
+	if err := ValidateAgenticContentBlocks(input, m.limits); err != nil {
+		return nil, err
+	}
+	stream, err := m.delegate.Stream(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderWithConvert(stream, func(message *schema.AgenticMessage) (*schema.AgenticMessage, error) {
+		if err := ValidateAgenticContentBlocks([]*schema.AgenticMessage{message}, m.limits); err != nil {
+			return nil, err
+		}
+		return message, nil
+	}), nil
+}
+
+// ValidateAgenticContentBlocks rejects a message collection whose total block
+// count exceeds the configured boundary without inspecting private block data.
+func ValidateAgenticContentBlocks(messages []*schema.AgenticMessage, limits AgenticLimits) error {
+	resolved, err := limits.Validate()
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		count += len(message.ContentBlocks)
+		if count > resolved.MaxContentBlocks {
+			return &ResourceLimitError{Resource: "content_blocks", Limit: int64(resolved.MaxContentBlocks), Actual: int64(count)}
+		}
+	}
+	return nil
 }
 
 // WithDefaults returns limits with every zero field replaced by its default.

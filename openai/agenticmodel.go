@@ -40,21 +40,26 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if cfg.MaxRetries != 0 {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("openai: agentic MaxRetries must be zero"))
 	}
-	if _, err := cfg.Limits.Validate(); err != nil {
+	limits, err := cfg.Limits.Validate()
+	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("openai: invalid agentic limits: %w", err))
 	}
-	zeroRetries := 0
-	var timeout *time.Duration
-	if cfg.Timeout != 0 {
-		timeout = &cfg.Timeout
+	clientSource := cfg.HTTPClient
+	if clientSource == nil && cfg.Timeout != 0 {
+		clientSource = &http.Client{Timeout: cfg.Timeout}
 	}
+	httpClient, err := einoproviders.NewAgenticLimitedHTTPClient(clientSource, limits)
+	if err != nil {
+		return nil, einoproviders.WrapInitError(fmt.Errorf("openai: build agentic limited client: %w", err))
+	}
+	zeroRetries := 0
 	m, err := agenticopenai.NewResponsesModel(ctx, &agenticopenai.ResponsesConfig{
 		APIKey: cfg.APIKey, Model: cfg.Model, BaseURL: cfg.BaseURL,
-		HTTPClient: cfg.HTTPClient, Timeout: timeout, MaxRetries: &zeroRetries,
+		HTTPClient: httpClient, MaxRetries: &zeroRetries,
 		MaxTokens: cfg.MaxTokens, Temperature: cfg.Temperature, TopP: cfg.TopP,
 	})
 	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("openai: build agentic responses model %q: %w", cfg.Model, err))
 	}
-	return m, nil
+	return einoproviders.NewBoundedAgenticModel(m, limits)
 }
