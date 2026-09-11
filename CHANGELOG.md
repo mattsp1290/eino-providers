@@ -4,6 +4,12 @@ This changelog is maintained by hand until `v1.0.0`.
 
 ## Unreleased
 
+- Added native Eino `model.AgenticModel` constructors for Claude Messages,
+  OpenAI Responses, Gemini generateContent, Ollama `/api/chat`, OpenAI-Codex
+  Responses, and OpenCode Go's explicit native protocol selection. The root
+  package now provides safe unsupported-capability/resource-limit errors and
+  shared agentic identity, continuation, and limit contracts.
+
 - Added `openaicodex.NewChatModel` / `NewChatModelWithHTTPClient`: a native
   Responses-API `model.ToolCallingChatModel` for the OpenAI-Codex subscription
   backend, with `Generate`, `Stream`, and immutable `WithTools`. Speaks the

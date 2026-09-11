@@ -2,6 +2,30 @@
 
 `eino-providers` is a shared Go module for constructing CloudWeGo Eino chat model providers across Claude, OpenAI, OpenAI-Codex, OpenCode Go, Gemini, and Ollama backends.
 
+## Native agentic models
+
+The module pins Eino `v0.9.19` and exposes native `model.AgenticModel`
+constructors from concrete provider packages. Import the specific provider;
+there is intentionally no root-level agentic factory.
+
+| Provider | Constructor | Native protocol |
+| --- | --- | --- |
+| Claude | `claude.NewAgenticModel` | Messages |
+| OpenAI | `openai.NewAgenticModel` | Responses |
+| Gemini | `gemini.NewAgenticModel` | generateContent |
+| Ollama | `ollama.NewAgenticModel` | `/api/chat` |
+| OpenAI-Codex | `openaicodex.NewAgenticModel` / `NewAgenticModelWithHTTPClient` | Responses |
+| OpenCode Go | `opencodego.NewAgenticModel` | explicit Responses, Messages, or Chat Completions |
+
+Agentic tools are request-time options, for example `model.WithTools`. A
+provider returns `ErrUnsupportedCapability` before dispatch when its selected
+native protocol cannot represent an input or option. `AgenticLimits` bounds
+request and response processing; zero values select documented defaults.
+
+OpenAI exposes `SplitAgenticContinuation` and
+`RestoreAgenticContinuation` to separate a safe display message from opaque
+provider continuation state before persistence.
+
 ```go
 package main
 
