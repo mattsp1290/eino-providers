@@ -251,6 +251,9 @@ func (m *agenticModel) request(input []*schema.AgenticMessage, stream bool, opts
 		}
 		if msg.Role == schema.AgenticRoleTypeSystem {
 			for _, c := range content {
+				if c["type"] != "text" {
+					return nil, &einoproviders.UnsupportedCapabilityError{Provider: "claude", Protocol: "messages", Capability: "system_content"}
+				}
 				if text, ok := c["text"].(string); ok {
 					system += text
 				}

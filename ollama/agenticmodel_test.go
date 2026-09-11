@@ -132,3 +132,11 @@ func TestAgenticModelAssignsSyntheticToolCallIDs(t *testing.T) {
 		t.Fatalf("CallID=%q", got)
 	}
 }
+
+func TestToOllamaAgenticMessagesRejectsMixedToolResult(t *testing.T) {
+	result := schema.NewContentBlock(&schema.FunctionToolResult{Name: "weather", Content: []*schema.FunctionToolResultContentBlock{{Type: schema.FunctionToolResultContentBlockTypeText, Text: &schema.UserInputText{Text: "sunny"}}}})
+	_, err := toOllamaAgenticMessages([]*schema.AgenticMessage{{Role: schema.AgenticRoleTypeAssistant, ContentBlocks: []*schema.ContentBlock{schema.NewContentBlock(&schema.AssistantGenText{Text: "mixed"}), result}}})
+	if !errors.Is(err, einoproviders.ErrUnsupportedCapability) {
+		t.Fatalf("error=%v", err)
+	}
+}

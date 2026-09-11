@@ -103,6 +103,14 @@ func TestAgenticModelRejectsMalformedBlockBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestAgenticModelRejectsNonTextSystemBlockBeforeDispatch(t *testing.T) {
+	m := &agenticModel{model: "m", maxTokens: 1, client: &http.Client{}, limits: einoproviders.AgenticLimits{}.WithDefaults()}
+	_, err := m.Generate(context.Background(), []*schema.AgenticMessage{{Role: schema.AgenticRoleTypeSystem, ContentBlocks: []*schema.ContentBlock{schema.NewContentBlock(&schema.Reasoning{Text: "private"})}}})
+	if !errors.Is(err, einoproviders.ErrUnsupportedCapability) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestAgenticModelStreamPreservesToolUse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

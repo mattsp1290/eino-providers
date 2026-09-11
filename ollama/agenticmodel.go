@@ -244,6 +244,19 @@ func toOllamaAgenticMessages(input []*schema.AgenticMessage) ([]ollamaMessage, e
 		if msg == nil {
 			return nil, &einoproviders.UnsupportedCapabilityError{Provider: "ollama", Protocol: "api/chat", Capability: "nil_message"}
 		}
+		toolResults := 0
+		for _, block := range msg.ContentBlocks {
+			if block != nil && block.Type == schema.ContentBlockTypeFunctionToolResult {
+				toolResults++
+			}
+		}
+		if toolResults != 0 {
+			if toolResults != 1 || len(msg.ContentBlocks) != 1 || msg.ContentBlocks[0] == nil || msg.ContentBlocks[0].FunctionToolResult == nil || len(msg.ContentBlocks[0].FunctionToolResult.Content) != 1 || msg.ContentBlocks[0].FunctionToolResult.Content[0].Type != schema.FunctionToolResultContentBlockTypeText || msg.ContentBlocks[0].FunctionToolResult.Content[0].Text == nil {
+				return nil, &einoproviders.UnsupportedCapabilityError{Provider: "ollama", Protocol: "api/chat", Capability: "function_result_shape"}
+			}
+			result = append(result, ollamaMessage{Role: "tool", ToolName: msg.ContentBlocks[0].FunctionToolResult.Name, Content: msg.ContentBlocks[0].FunctionToolResult.Content[0].Text.Text})
+			continue
+		}
 		out := ollamaMessage{Role: string(msg.Role)}
 		if out.Role != "system" && out.Role != "user" && out.Role != "assistant" {
 			return nil, &einoproviders.UnsupportedCapabilityError{Provider: "ollama", Protocol: "api/chat", Capability: "role"}
@@ -288,10 +301,7 @@ func toOllamaAgenticMessages(input []*schema.AgenticMessage) ([]ollamaMessage, e
 				call.Function.Name, call.Function.Arguments = block.FunctionToolCall.Name, args
 				out.ToolCalls = append(out.ToolCalls, call)
 			case schema.ContentBlockTypeFunctionToolResult:
-				if block.FunctionToolResult == nil || len(block.FunctionToolResult.Content) != 1 || block.FunctionToolResult.Content[0].Type != schema.FunctionToolResultContentBlockTypeText || block.FunctionToolResult.Content[0].Text == nil {
-					return nil, &einoproviders.UnsupportedCapabilityError{Provider: "ollama", Protocol: "api/chat", Capability: "function_result"}
-				}
-				out.Role, out.ToolName, out.Content = "tool", block.FunctionToolResult.Name, block.FunctionToolResult.Content[0].Text.Text
+				return nil, &einoproviders.UnsupportedCapabilityError{Provider: "ollama", Protocol: "api/chat", Capability: "function_result_shape"}
 			default:
 				return nil, &einoproviders.UnsupportedCapabilityError{Provider: "ollama", Protocol: "api/chat", Capability: einoproviders.Capability(block.Type)}
 			}
