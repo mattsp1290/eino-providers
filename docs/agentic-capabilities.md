@@ -7,7 +7,7 @@ dispatch rather than flattened into a classic `schema.Message`.
 | Provider/protocol | Native input/output slice | Explicitly rejected before dispatch |
 | --- | --- | --- |
 | OpenAI Responses | text, reasoning, function calls/results, request-time tools, Responses server/MCP features supplied by the upstream adapter | malformed or unsupported upstream agentic blocks/options |
-| Claude Messages | system/user/assistant text, thinking/signatures, function calls/results | deferred/client tool search and unsupported block kinds |
+| Claude Messages | system/user/assistant text, thinking/signatures, function calls/results | request-time tools, deferred/client tool search, and unsupported block kinds |
 | Gemini generateContent | upstream native multimodal/function/server-tool surface and agentic choice | deferred tools and client tool search |
 | Ollama `/api/chat` | text/image input, thinking, text/function output, ordinary tools | agentic choice, deferred/search/server/MCP tools, unsupported media |
 | OpenAI-Codex Responses | system/user/assistant text, encrypted reasoning, function calls/results, ordinary tools | deferred/search/server/MCP tools and unsupported media |
@@ -37,3 +37,14 @@ close response bodies when their producer exits, but cannot guarantee that an
 early consumer `Close` interrupts a scanner currently blocked in a body read.
 This is an accepted upstream API boundary, not a successful-completion signal;
 callers that need immediate cancellation must cancel the stream context.
+
+## Explicit degraded paths
+
+Gemini accepts a caller-owned `*genai.Client` for cache/transport ownership.
+That SDK does not expose its underlying HTTP transport, so byte-level request,
+response, error-body, and event caps cannot be injected after construction;
+the shared content-block and inline-media checks still apply. Callers requiring
+full byte-limit enforcement should provide `HTTPClient` and let this package
+construct the Gemini client. Claude request-time `WithTools` is deliberately
+rejected before dispatch until its native Messages tool encoding has complete
+fixture coverage.

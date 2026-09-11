@@ -99,6 +99,14 @@ func TestAgenticModelRejectsToolSearchBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestAgenticModelRejectsToolsBeforeDispatch(t *testing.T) {
+	m := &agenticModel{model: "m", maxTokens: 1, client: &http.Client{}, limits: einoproviders.AgenticLimits{}.WithDefaults()}
+	_, err := m.Generate(context.Background(), nil, model.WithTools([]*schema.ToolInfo{{Name: "weather"}}))
+	if !errors.Is(err, einoproviders.ErrUnsupportedCapability) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestAgenticModelRejectsMalformedBlockBeforeDispatch(t *testing.T) {
 	m := &agenticModel{model: "m", maxTokens: 1, client: &http.Client{}, limits: einoproviders.AgenticLimits{}.WithDefaults()}
 	_, err := m.Generate(context.Background(), []*schema.AgenticMessage{{Role: schema.AgenticRoleTypeUser, ContentBlocks: []*schema.ContentBlock{{Type: schema.ContentBlockTypeUserInputText}}}})

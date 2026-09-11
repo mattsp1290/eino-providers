@@ -202,6 +202,9 @@ func (m *agenticModel) httpError(resp *http.Response) error {
 
 func (m *agenticModel) request(input []*schema.AgenticMessage, stream bool, opts ...model.Option) ([]byte, error) {
 	common := model.GetCommonOptions(&model.Options{}, opts...)
+	if len(common.Tools) != 0 {
+		return nil, &einoproviders.UnsupportedCapabilityError{Provider: "claude", Protocol: "messages", Capability: "tools"}
+	}
 	if common.ToolSearchTool != nil || len(common.DeferredTools) != 0 {
 		return nil, &einoproviders.UnsupportedCapabilityError{Provider: "claude", Protocol: "messages", Capability: "tool_search"}
 	}
