@@ -34,7 +34,7 @@ func TestAgenticModelUsesNativeMessagesBytes(t *testing.T) {
 			return
 		}
 		if request["stream"] == true {
-			_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"native-claude\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+			_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_native\",\"model\":\"native-claude\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reason\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
 			return
 		}
 		_, _ = w.Write([]byte(`{"id":"msg_native","model":"native-claude","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"reason","signature":"sig"},{"type":"text","text":"hello"}],"usage":{"input_tokens":2,"output_tokens":3}}`))
@@ -81,6 +81,10 @@ func TestAgenticModelUsesNativeMessagesBytes(t *testing.T) {
 	}
 	if len(concatenated.ContentBlocks) != len(generated.ContentBlocks) || concatenated.ContentBlocks[0].Reasoning.Signature != generated.ContentBlocks[0].Reasoning.Signature || concatenated.ContentBlocks[1].AssistantGenText.Text != generated.ContentBlocks[1].AssistantGenText.Text {
 		t.Fatalf("stream concat = %#v, generate = %#v", concatenated, generated)
+	}
+	streamIdentity := concatenated.ResponseMeta.Extension.(einoproviders.AgenticResponseIdentity)
+	if streamIdentity.CorrelationID != "msg_native" {
+		t.Fatalf("stream identity = %#v", streamIdentity)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("calls = %d", calls.Load())

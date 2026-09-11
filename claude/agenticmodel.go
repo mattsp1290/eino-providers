@@ -106,7 +106,7 @@ func (m *agenticModel) Stream(ctx context.Context, input []*schema.AgenticMessag
 		defer writer.Close()
 		scanner := bufio.NewScanner(io.LimitReader(resp.Body, m.limits.MaxResponseBytes+1))
 		scanner.Buffer(make([]byte, 64<<10), int(m.limits.MaxEventBytes))
-		modelID, complete := "", false
+		modelID, correlationID, complete := "", "", false
 		calls := map[int]*claudePendingToolCall{}
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
@@ -120,6 +120,7 @@ func (m *agenticModel) Stream(ctx context.Context, input []*schema.AgenticMessag
 			}
 			if event.Type == "message_start" {
 				modelID = event.Message.Model
+				correlationID = event.Message.ID
 				continue
 			}
 			if event.Type == "content_block_start" && event.ContentBlock.Type == "tool_use" {
@@ -157,7 +158,7 @@ func (m *agenticModel) Stream(ctx context.Context, input []*schema.AgenticMessag
 			}
 			if event.Type == "message_stop" {
 				complete = true
-				if writer.Send(&schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, ResponseMeta: &schema.AgenticResponseMeta{Extension: einoproviders.AgenticResponseIdentity{Provider: "claude", Protocol: "messages", RequestedModel: m.model, ReturnedModel: modelID}}}, nil) {
+				if writer.Send(&schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, ResponseMeta: &schema.AgenticResponseMeta{Extension: einoproviders.AgenticResponseIdentity{Provider: "claude", Protocol: "messages", RequestedModel: m.model, ReturnedModel: modelID, CorrelationID: correlationID}}}, nil) {
 					return
 				}
 				return
@@ -319,6 +320,7 @@ type claudeStreamEvent struct {
 		Name string `json:"name"`
 	} `json:"content_block"`
 	Message struct {
+		ID    string `json:"id"`
 		Model string `json:"model"`
 	} `json:"message"`
 }
