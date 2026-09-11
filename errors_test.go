@@ -80,3 +80,23 @@ func TestClassifyProviderSentinels(t *testing.T) {
 		})
 	}
 }
+
+func TestAgenticErrorsClassifyWithoutContentDisclosure(t *testing.T) {
+	unsupported := &UnsupportedCapabilityError{Provider: "openai", Protocol: "responses", Capability: "user_input_audio"}
+	if !errors.Is(unsupported, ErrUnsupportedCapability) {
+		t.Fatal("unsupported error does not match sentinel")
+	}
+	if got := Classify(unsupported); got != ErrorClassUnsupportedCapability {
+		t.Fatalf("Classify(unsupported) = %v", got)
+	}
+	limited := &ResourceLimitError{Resource: "event_bytes", Limit: 1, Actual: 2}
+	if !errors.Is(limited, ErrResourceLimit) {
+		t.Fatal("resource limit error does not match sentinel")
+	}
+	if got := Classify(limited); got != ErrorClassResourceLimit {
+		t.Fatalf("Classify(limited) = %v", got)
+	}
+	if got := limited.Error(); got != "agentic resource limit exceeded: event_bytes" {
+		t.Fatalf("unsafe resource error string: %q", got)
+	}
+}

@@ -6,15 +6,18 @@ Accepted
 
 ## Context
 
-Advisor already uses the CloudWeGo Eino `v0.8.x` line, while local-symphony
-started on `v0.7.13`. The shared provider module needs one exact core version
-so the `model.ToolCallingChatModel` and schema surfaces are tested consistently.
+The initial provider surface used the CloudWeGo Eino `v0.8.x` line. Native
+agentic models require Eino's `model.AgenticModel` and `schema.AgenticMessage`
+surfaces, which were stabilized on the v0.9 line. The shared provider module
+needs one exact core version so classic and agentic model surfaces are tested
+consistently.
 
 Backend packages also depend on separate `eino-ext` modules.
 
 ## Decision
 
-For `v0.1.0`, pin `github.com/cloudwego/eino` to `v0.8.13`.
+For the native agentic-model release, pin `github.com/cloudwego/eino` to
+`v0.9.19`.
 
 Use these backend extension pins unless a backend lift proves an incompatibility:
 
@@ -25,8 +28,10 @@ Use these backend extension pins unless a backend lift proves an incompatibility
 
 ## Consequences
 
-Consumers must align to Eino `v0.8.13` before adopting this module.
-local-symphony's phase-zero bump handles that prerequisite.
+Consumers must align to Eino `v0.9.19` before adopting the agentic
+constructors. This is a deliberate breaking dependency upgrade; classic
+constructors remain available but are not a compatibility promise for older
+Eino versions.
 
 Future Eino bumps should be deliberate PRs with backend tests and construction
 benchmarks, not incidental dependency churn.

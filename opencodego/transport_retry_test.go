@@ -210,18 +210,14 @@ func TestMessagesSDKCancellationDuringBackoffPreventsNextTransportCall(t *testin
 	case <-time.After(time.Second):
 		t.Fatal("SDK did not close the retry response before backoff")
 	}
-	canceledAt := time.Now()
 	cancel()
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Messages.New() error = %v, want cancellation", err)
 		}
-		if elapsed := time.Since(canceledAt); elapsed < 40*time.Millisecond {
-			t.Fatalf("cancellation returned after %v, want current SDK backoff to complete", elapsed)
-		}
 	case <-time.After(time.Second):
-		t.Fatal("Messages.New() did not return after retry backoff")
+		t.Fatal("Messages.New() did not return after cancellation")
 	}
 	mu.Lock()
 	gotAttempts := attempts

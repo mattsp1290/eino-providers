@@ -10,6 +10,13 @@ var (
 	ErrProviderAuth       = errors.New("provider auth error")
 	ErrUnknownProvider    = errors.New("unknown provider")
 	ErrBackendUnreachable = errors.New("backend unreachable")
+	// ErrUnsupportedCapability reports an agentic input or option that the
+	// selected native provider protocol cannot represent. It is always raised
+	// before a request is dispatched.
+	ErrUnsupportedCapability = errors.New("unsupported agentic capability")
+	// ErrResourceLimit reports an agentic request or response that exceeded a
+	// configured boundary.
+	ErrResourceLimit = errors.New("agentic resource limit exceeded")
 )
 
 // ErrorClass is the switch-friendly classification returned by Classify.
@@ -23,6 +30,8 @@ const (
 	ErrorClassProviderAuth
 	ErrorClassUnknownProvider
 	ErrorClassBackendUnreachable
+	ErrorClassUnsupportedCapability
+	ErrorClassResourceLimit
 )
 
 // Classify returns the first matching provider error class for err.
@@ -32,6 +41,10 @@ func Classify(err error) ErrorClass {
 		return ErrorClassUnknown
 	case errors.Is(err, ErrProviderTimeout):
 		return ErrorClassProviderTimeout
+	case errors.Is(err, ErrUnsupportedCapability):
+		return ErrorClassUnsupportedCapability
+	case errors.Is(err, ErrResourceLimit):
+		return ErrorClassResourceLimit
 	case errors.Is(err, ErrProviderInit):
 		return ErrorClassProviderInit
 	case errors.Is(err, ErrProviderAuth):
@@ -45,6 +58,51 @@ func Classify(err error) ErrorClass {
 	default:
 		return ErrorClassUnknown
 	}
+}
+
+// Capability identifies a native protocol feature for capability errors. It
+// intentionally contains no caller content, credentials, or opaque state.
+type Capability string
+
+// UnsupportedCapabilityError is returned before transport dispatch when a
+// concrete agentic provider cannot faithfully encode a requested feature.
+type UnsupportedCapabilityError struct {
+	Provider   string
+	Protocol   string
+	Capability Capability
+}
+
+func (e *UnsupportedCapabilityError) Error() string {
+	if e == nil {
+		return ErrUnsupportedCapability.Error()
+	}
+	if e.Provider == "" && e.Protocol == "" && e.Capability == "" {
+		return ErrUnsupportedCapability.Error()
+	}
+	return "unsupported agentic capability: " + e.Provider + "/" + e.Protocol + "/" + string(e.Capability)
+}
+
+func (e *UnsupportedCapabilityError) Is(target error) bool {
+	return target == ErrUnsupportedCapability
+}
+
+// ResourceLimitError identifies a bounded agentic resource without retaining
+// the content that exceeded it.
+type ResourceLimitError struct {
+	Resource string
+	Limit    int64
+	Actual   int64
+}
+
+func (e *ResourceLimitError) Error() string {
+	if e == nil {
+		return ErrResourceLimit.Error()
+	}
+	return "agentic resource limit exceeded: " + e.Resource
+}
+
+func (e *ResourceLimitError) Is(target error) bool {
+	return target == ErrResourceLimit
 }
 
 type initErr struct{ cause error }

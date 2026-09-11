@@ -656,7 +656,7 @@ func TestIntegrationRetryMessagesPolicyAndTiming(t *testing.T) {
 		})
 	}
 
-	t.Run("cancellation waits for current SDK sleep and prevents another call", func(t *testing.T) {
+	t.Run("cancellation interrupts SDK backoff and prevents another call", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		closed := make(chan struct{})
@@ -680,17 +680,11 @@ func TestIntegrationRetryMessagesPolicyAndTiming(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("retry response was not closed before backoff")
 		}
-		canceledAt := time.Now()
 		cancel()
 		select {
 		case err := <-done:
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Generate error = %v, want context.Canceled", err)
-			}
-			// The pinned SDK uses time.Sleep. Cancellation prevents another
-			// request but returns only after the current short backoff ends.
-			if elapsed := time.Since(canceledAt); elapsed < 40*time.Millisecond {
-				t.Fatalf("cancellation returned after %v, before current SDK sleep ended", elapsed)
 			}
 		case <-time.After(time.Second):
 			t.Fatal("Generate did not return after retry backoff")
