@@ -303,6 +303,7 @@ type claudeStreamEvent struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 	ContentBlock struct {
@@ -348,6 +349,8 @@ func (m *agenticModel) deltaMessage(event claudeStreamEvent) *schema.AgenticMess
 		block = schema.NewContentBlock(&schema.AssistantGenText{Text: event.Delta.Text})
 	case "thinking_delta":
 		block = schema.NewContentBlock(&schema.Reasoning{Text: event.Delta.Thinking})
+	case "signature_delta":
+		block = schema.NewContentBlock(&schema.Reasoning{Signature: event.Delta.Signature})
 	default:
 		return nil
 	}
