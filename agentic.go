@@ -13,6 +13,15 @@ type AgenticResponseIdentity struct {
 	CorrelationID  string `json:"correlation_id,omitempty"`
 }
 
+// AgenticResponseMetadata preserves a provider adapter's native response
+// extension while adding the stable identity fields exposed by this module.
+// It is used where a protocol adapter already returned extension data that
+// callers may rely on; replacing that data would lose correlation details.
+type AgenticResponseMetadata struct {
+	Identity AgenticResponseIdentity `json:"identity"`
+	Native   any                     `json:"native,omitempty"`
+}
+
 // AgenticContinuationState is an opaque, versioned provider payload returned
 // by a provider's SplitAgenticContinuation helper. Applications may persist it
 // alongside the sanitized public message, but must not inspect or display it.

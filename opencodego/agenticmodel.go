@@ -32,6 +32,7 @@ type openCodeAgenticModel struct {
 	delegate model.AgenticModel
 	provider string
 	protocol string
+	model    string
 	limits   einoproviders.AgenticLimits
 }
 
@@ -65,7 +66,14 @@ func (m *openCodeAgenticModel) attachIdentity(message *schema.AgenticMessage) {
 	if message == nil || message.ResponseMeta == nil {
 		return
 	}
-	message.ResponseMeta.Extension = einoproviders.AgenticResponseIdentity{Provider: m.provider, Protocol: m.protocol}
+	identity := einoproviders.AgenticResponseIdentity{Provider: m.provider, Protocol: m.protocol, RequestedModel: m.model}
+	if native, ok := message.ResponseMeta.Extension.(einoproviders.AgenticResponseIdentity); ok {
+		identity.ReturnedModel = native.ReturnedModel
+		identity.CorrelationID = native.CorrelationID
+		message.ResponseMeta.Extension = identity
+		return
+	}
+	message.ResponseMeta.Extension = einoproviders.AgenticResponseMetadata{Identity: identity, Native: message.ResponseMeta.Extension}
 }
 
 func validateOpenCodeAgenticOptions(protocol string, opts ...model.Option) error {
@@ -101,7 +109,7 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 		if err != nil {
 			return nil, mapConstructorError(err)
 		}
-		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "responses", limits: limits}, nil
+		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "responses", model: prepared.model, limits: limits}, nil
 	case ProtocolChatCompletions:
 		httpClient, err := newObservedHTTPClient(prepared.authClient)
 		if err != nil {
@@ -111,7 +119,7 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 		if err != nil {
 			return nil, mapConstructorError(err)
 		}
-		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "chat_completions", limits: limits}, nil
+		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "chat_completions", model: prepared.model, limits: limits}, nil
 	case ProtocolMessages:
 		if prepared.maxTokens == nil {
 			return nil, mapConstructorError(fmt.Errorf("opencodego: MaxTokens is required for Messages"))
@@ -124,7 +132,7 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 		if err != nil {
 			return nil, err
 		}
-		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "messages", limits: limits}, nil
+		return &openCodeAgenticModel{delegate: m, provider: "opencodego", protocol: "messages", model: prepared.model, limits: limits}, nil
 	default:
 		return nil, mapConstructorError(fmt.Errorf("opencodego: unsupported Protocol %q", prepared.protocol))
 	}

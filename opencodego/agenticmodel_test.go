@@ -28,3 +28,19 @@ func TestValidateOpenCodeAgenticOptionsRejectsBeforeDispatch(t *testing.T) {
 		t.Fatalf("choice error = %v", err)
 	}
 }
+
+func TestAttachIdentityPreservesNativeExtension(t *testing.T) {
+	m := &openCodeAgenticModel{provider: "opencodego", protocol: "responses", model: "gpt-test"}
+	message := &schema.AgenticMessage{ResponseMeta: &schema.AgenticResponseMeta{Extension: map[string]string{"request_id": "req_1"}}}
+	m.attachIdentity(message)
+	metadata, ok := message.ResponseMeta.Extension.(einoproviders.AgenticResponseMetadata)
+	if !ok {
+		t.Fatalf("extension type = %T", message.ResponseMeta.Extension)
+	}
+	if metadata.Identity.RequestedModel != "gpt-test" || metadata.Identity.Provider != "opencodego" {
+		t.Fatalf("identity = %#v", metadata.Identity)
+	}
+	if _, ok := metadata.Native.(map[string]string); !ok {
+		t.Fatalf("native extension = %T", metadata.Native)
+	}
+}

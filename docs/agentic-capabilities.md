@@ -15,7 +15,9 @@ dispatch rather than flattened into a classic `schema.Message`.
 | OpenCode Messages | native Messages surface | deferred/client tool search |
 | OpenCode Chat Completions | native Chat Completions surface | deferred/client tool search and agentic tool choice |
 
-All constructors use the shared `AgenticLimits` validation contract. Deterministic
-fixture tests are the source of truth for each implemented request/response
-codec; credentialed live verification remains opt-in and is never used as
-ordinary CI evidence.
+All constructors validate the shared `AgenticLimits` contract. Direct HTTP
+codecs enforce request, response, event, and error-body limits; upstream
+adapter-backed codecs validate the configured limits but rely on their upstream
+transport for runtime body enforcement. Deterministic fixture tests are the
+source of truth for each implemented request/response codec; credentialed live
+verification remains opt-in and is never used as ordinary CI evidence.
