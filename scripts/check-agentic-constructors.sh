@@ -22,6 +22,8 @@ import (
 	"net/http"
 
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/schema"
+	einoproviders "github.com/mattsp1290/eino-providers"
 	"github.com/mattsp1290/eino-providers/claude"
 	"github.com/mattsp1290/eino-providers/gemini"
 	"github.com/mattsp1290/eino-providers/ollama"
@@ -38,6 +40,12 @@ var (
 	_ func(context.Context, openaicodex.AgenticModelConfig) (model.AgenticModel, error) = openaicodex.NewAgenticModel
 	_ func(context.Context, *http.Client, openaicodex.AgenticModelConfig) (model.AgenticModel, error) = openaicodex.NewAgenticModelWithHTTPClient
 	_ func(context.Context, opencodego.AgenticModelConfig) (model.AgenticModel, error) = opencodego.NewAgenticModel
+	_ func(*schema.AgenticMessage) (*schema.AgenticMessage, einoproviders.AgenticContinuationState, error) = claude.SplitAgenticContinuation
+	_ func(*schema.AgenticMessage) (*schema.AgenticMessage, einoproviders.AgenticContinuationState, error) = gemini.SplitAgenticContinuation
+	_ func(*schema.AgenticMessage) (*schema.AgenticMessage, einoproviders.AgenticContinuationState, error) = ollama.SplitAgenticContinuation
+	_ func(*schema.AgenticMessage) (*schema.AgenticMessage, einoproviders.AgenticContinuationState, error) = openai.SplitAgenticContinuation
+	_ func(*schema.AgenticMessage) (*schema.AgenticMessage, einoproviders.AgenticContinuationState, error) = openaicodex.SplitAgenticContinuation
+	_ func(*schema.AgenticMessage) (*schema.AgenticMessage, einoproviders.AgenticContinuationState, error) = opencodego.SplitAgenticContinuation
 )
 EOF
 go mod tidy

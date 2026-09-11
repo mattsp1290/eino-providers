@@ -2,11 +2,14 @@ package einoproviders
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 )
+
+const agenticContinuationVersion = 1
 
 // AgenticResponseIdentity records the provider identity observed for a native
 // agentic response. RequestedModel and ReturnedModel are deliberately kept
@@ -38,6 +41,158 @@ type AgenticContinuationState struct {
 	Version       uint32 `json:"version"`
 	CorrelationID string `json:"correlation_id,omitempty"`
 	Opaque        []byte `json:"opaque,omitempty"`
+}
+
+type agenticContinuationPayload struct {
+	MessageExtra map[string]json.RawMessage   `json:"message_extra,omitempty"`
+	BlockExtra   []map[string]json.RawMessage `json:"block_extra,omitempty"`
+	Signatures   map[int]string               `json:"reasoning_signatures,omitempty"`
+}
+
+// SplitAgenticContinuationForProvider creates an immutable display-safe
+// projection and a provider-tagged opaque continuation envelope. It removes
+// extras and reasoning signatures from the public clone only; callers must
+// retain the returned state to resume provider-native execution.
+func SplitAgenticContinuationForProvider(msg *schema.AgenticMessage, provider, protocol string) (*schema.AgenticMessage, AgenticContinuationState, error) {
+	if msg == nil {
+		return nil, AgenticContinuationState{}, fmt.Errorf("%s: nil agentic message", provider)
+	}
+	if provider == "" || protocol == "" {
+		return nil, AgenticContinuationState{}, fmt.Errorf("agentic continuation requires provider and protocol")
+	}
+	public, err := cloneAgenticMessageForContinuation(msg)
+	if err != nil {
+		return nil, AgenticContinuationState{}, err
+	}
+	payload := agenticContinuationPayload{BlockExtra: make([]map[string]json.RawMessage, len(msg.ContentBlocks)), Signatures: map[int]string{}}
+	if payload.MessageExtra, err = marshalContinuationExtra(msg.Extra); err != nil {
+		return nil, AgenticContinuationState{}, err
+	}
+	public.Extra = nil
+	for i, block := range msg.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		if payload.BlockExtra[i], err = marshalContinuationExtra(block.Extra); err != nil {
+			return nil, AgenticContinuationState{}, err
+		}
+		if public.ContentBlocks[i] == nil {
+			continue
+		}
+		public.ContentBlocks[i].Extra = nil
+		if reasoning := public.ContentBlocks[i].Reasoning; reasoning != nil {
+			payload.Signatures[i] = reasoning.Signature
+			reasoning.Signature = ""
+		}
+	}
+	if len(payload.Signatures) == 0 {
+		payload.Signatures = nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, AgenticContinuationState{}, fmt.Errorf("%s: encode continuation: %w", provider, err)
+	}
+	return public, AgenticContinuationState{Provider: provider, Protocol: protocol, Version: agenticContinuationVersion, CorrelationID: continuationCorrelationID(msg), Opaque: encoded}, nil
+}
+
+// RestoreAgenticContinuationForProvider recombines a public clone and opaque
+// provider state without mutating either input.
+func RestoreAgenticContinuationForProvider(public *schema.AgenticMessage, state AgenticContinuationState, provider, protocol string) (*schema.AgenticMessage, error) {
+	if public == nil {
+		return nil, fmt.Errorf("%s: nil public agentic message", provider)
+	}
+	if state.Provider != provider || state.Protocol != protocol || state.Version != agenticContinuationVersion {
+		return nil, fmt.Errorf("%s: incompatible agentic continuation state", provider)
+	}
+	if correlationID := continuationCorrelationID(public); state.CorrelationID != "" && correlationID != "" && state.CorrelationID != correlationID {
+		return nil, fmt.Errorf("%s: continuation correlation mismatch", provider)
+	}
+	var payload agenticContinuationPayload
+	if err := json.Unmarshal(state.Opaque, &payload); err != nil {
+		return nil, fmt.Errorf("%s: decode continuation: %w", provider, err)
+	}
+	if len(payload.BlockExtra) != 0 && len(payload.BlockExtra) != len(public.ContentBlocks) {
+		return nil, fmt.Errorf("%s: continuation block count mismatch", provider)
+	}
+	restored, err := cloneAgenticMessageForContinuation(public)
+	if err != nil {
+		return nil, err
+	}
+	restored.Extra, err = unmarshalContinuationExtra(payload.MessageExtra)
+	if err != nil {
+		return nil, err
+	}
+	for i := range restored.ContentBlocks {
+		if restored.ContentBlocks[i] == nil {
+			continue
+		}
+		if len(payload.BlockExtra) != 0 {
+			restored.ContentBlocks[i].Extra, err = unmarshalContinuationExtra(payload.BlockExtra[i])
+			if err != nil {
+				return nil, err
+			}
+		}
+		if signature, ok := payload.Signatures[i]; ok && restored.ContentBlocks[i].Reasoning != nil {
+			restored.ContentBlocks[i].Reasoning.Signature = signature
+		}
+	}
+	return restored, nil
+}
+
+func cloneAgenticMessageForContinuation(msg *schema.AgenticMessage) (*schema.AgenticMessage, error) {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("clone agentic message: %w", err)
+	}
+	var clone schema.AgenticMessage
+	if err := json.Unmarshal(b, &clone); err != nil {
+		return nil, fmt.Errorf("clone agentic message: %w", err)
+	}
+	return &clone, nil
+}
+
+func marshalContinuationExtra(extra map[string]any) (map[string]json.RawMessage, error) {
+	if len(extra) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(extra)
+	if err != nil {
+		return nil, fmt.Errorf("encode continuation extra: %w", err)
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func unmarshalContinuationExtra(extra map[string]json.RawMessage) (map[string]any, error) {
+	if len(extra) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]any, len(extra))
+	for key, value := range extra {
+		var decoded any
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return nil, fmt.Errorf("decode continuation extra: %w", err)
+		}
+		result[key] = decoded
+	}
+	return result, nil
+}
+
+func continuationCorrelationID(msg *schema.AgenticMessage) string {
+	if msg == nil || msg.ResponseMeta == nil {
+		return ""
+	}
+	switch extension := msg.ResponseMeta.Extension.(type) {
+	case AgenticResponseIdentity:
+		return extension.CorrelationID
+	case AgenticResponseMetadata:
+		return extension.Identity.CorrelationID
+	default:
+		return ""
+	}
 }
 
 const (

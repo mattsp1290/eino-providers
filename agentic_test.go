@@ -30,3 +30,21 @@ func TestValidateAgenticContentBlocksRejectsOverLimit(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestSplitRestoreAgenticContinuationDoesNotMutatePublicMessage(t *testing.T) {
+	message := &schema.AgenticMessage{Extra: map[string]any{"private": "sentinel"}}
+	public, state, err := SplitAgenticContinuationForProvider(message, "test", "native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if public.Extra != nil || message.Extra["private"] != "sentinel" {
+		t.Fatalf("public/source extras = %#v / %#v", public.Extra, message.Extra)
+	}
+	restored, err := RestoreAgenticContinuationForProvider(public, state, "test", "native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Extra["private"] != "sentinel" {
+		t.Fatalf("restored extra = %#v", restored.Extra)
+	}
+}
