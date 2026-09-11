@@ -6,15 +6,20 @@ import (
 	"testing"
 
 	"github.com/cloudwego/eino/schema"
+
+	einoproviders "github.com/mattsp1290/eino-providers"
 )
 
 func TestAgenticContinuationSeparatesPrivateState(t *testing.T) {
-	source := &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, Extra: map[string]any{"private": "cache-secret"}, ContentBlocks: []*schema.ContentBlock{
+	source := &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, ResponseMeta: &schema.AgenticResponseMeta{Extension: einoproviders.AgenticResponseIdentity{Provider: "openai", Protocol: "responses", CorrelationID: "resp_native"}}, Extra: map[string]any{"private": "cache-secret"}, ContentBlocks: []*schema.ContentBlock{
 		{Type: schema.ContentBlockTypeReasoning, Reasoning: &schema.Reasoning{Text: "visible", Signature: "encrypted-secret"}, Extra: map[string]any{"item": "item-secret"}},
 	}}
 	public, state, err := SplitAgenticContinuation(source)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if state.CorrelationID != "resp_native" {
+		t.Fatalf("state correlation = %q", state.CorrelationID)
 	}
 	encodedPublic, err := json.Marshal(public)
 	if err != nil {
