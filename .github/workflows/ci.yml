@@ -36,16 +36,22 @@ jobs:
         run: |
           packages="$(go list ./... 2>/dev/null || true)"
           if [ -n "$packages" ]; then
-            go test $packages
+            go test -race $packages
           else
             echo "No Go packages yet."
           fi
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Check non-Codex backend dependency graph
         run: scripts/check-dep-leaks.sh
 
       - name: Check Gemini construction benchmark
         run: bash scripts/check-gemini-benchmark.sh
+
+      - name: Check agentic public constructors
+        run: bash scripts/check-agentic-constructors.sh
 
       - name: Lint
         if: ${{ hashFiles('**/*.go') != '' }}
