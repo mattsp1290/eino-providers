@@ -121,3 +121,14 @@ func TestAgenticModelRejectsUnsupportedOptionsBeforeDispatch(t *testing.T) {
 		t.Fatalf("chat calls = %d, want 0", chatCalls.Load())
 	}
 }
+
+func TestAgenticModelAssignsSyntheticToolCallIDs(t *testing.T) {
+	m := &agenticModel{model: "m"}
+	message := m.fromResponse(ollamaChatResponse{Message: ollamaMessage{ToolCalls: []ollamaToolCall{{Function: struct {
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
+	}{Name: "weather", Arguments: map[string]any{"city": "NYC"}}}}}}, false)
+	if got := message.ContentBlocks[0].FunctionToolCall.CallID; got != "ollama-0" {
+		t.Fatalf("CallID=%q", got)
+	}
+}

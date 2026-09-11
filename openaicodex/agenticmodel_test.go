@@ -70,3 +70,11 @@ func TestAgenticModelRejectsUnsupportedOptionBeforeDispatch(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+func TestAgenticModelRejectsMalformedBlockBeforeDispatch(t *testing.T) {
+	m := &agenticModel{model: "m", httpClient: &http.Client{}, limits: einoproviders.AgenticLimits{}.WithDefaults()}
+	_, err := m.Stream(context.Background(), []*schema.AgenticMessage{{Role: schema.AgenticRoleTypeUser, ContentBlocks: []*schema.ContentBlock{{Type: schema.ContentBlockTypeUserInputText}}}})
+	if !errors.Is(err, einoproviders.ErrUnsupportedCapability) {
+		t.Fatalf("error=%v", err)
+	}
+}

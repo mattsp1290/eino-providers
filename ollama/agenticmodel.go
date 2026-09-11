@@ -338,9 +338,11 @@ func (m *agenticModel) fromResponse(wire ollamaChatResponse, streaming bool) *sc
 	if wire.Message.Content != "" {
 		add(schema.NewContentBlock(&schema.AssistantGenText{Text: wire.Message.Content}))
 	}
-	for _, call := range wire.Message.ToolCalls {
+	for callIndex, call := range wire.Message.ToolCalls {
 		args, _ := json.Marshal(call.Function.Arguments)
-		add(schema.NewContentBlock(&schema.FunctionToolCall{Name: call.Function.Name, Arguments: string(args)}))
+		// Ollama does not expose a wire call ID. This is deliberately a
+		// request-local synthetic correlation ID and is never serialized back.
+		add(schema.NewContentBlock(&schema.FunctionToolCall{CallID: fmt.Sprintf("ollama-%d", callIndex), Name: call.Function.Name, Arguments: string(args)}))
 	}
 	message := &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, ContentBlocks: blocks}
 	if !streaming || wire.Done {

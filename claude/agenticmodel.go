@@ -103,6 +103,7 @@ func (m *agenticModel) Stream(ctx context.Context, input []*schema.AgenticMessag
 		scanner := bufio.NewScanner(io.LimitReader(resp.Body, m.limits.MaxResponseBytes+1))
 		scanner.Buffer(make([]byte, 64<<10), int(m.limits.MaxEventBytes))
 		modelID, complete := "", false
+		calls := map[int]*claudePendingToolCall{}
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if !strings.HasPrefix(line, "data:") {
@@ -117,9 +118,33 @@ func (m *agenticModel) Stream(ctx context.Context, input []*schema.AgenticMessag
 				modelID = event.Message.Model
 				continue
 			}
+			if event.Type == "content_block_start" && event.ContentBlock.Type == "tool_use" {
+				calls[event.Index] = &claudePendingToolCall{id: event.ContentBlock.ID, name: event.ContentBlock.Name}
+				continue
+			}
 			if event.Type == "content_block_delta" {
+				if call := calls[event.Index]; call != nil && event.Delta.Type == "input_json_delta" {
+					call.arguments.WriteString(event.Delta.PartialJSON)
+					continue
+				}
 				if chunk := m.deltaMessage(event); chunk != nil && writer.Send(chunk, nil) {
 					return
+				}
+				continue
+			}
+			if event.Type == "content_block_stop" {
+				if call := calls[event.Index]; call != nil {
+					args := call.arguments.String()
+					if !json.Valid([]byte(args)) {
+						writer.Send(nil, &einoproviders.UnsupportedCapabilityError{Provider: "claude", Protocol: "messages", Capability: "function_arguments"})
+						return
+					}
+					block := schema.NewContentBlock(&schema.FunctionToolCall{CallID: call.id, Name: call.name, Arguments: args})
+					block.StreamingMeta = &schema.StreamingMeta{Index: event.Index}
+					if writer.Send(&schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, ContentBlocks: []*schema.ContentBlock{block}}, nil) {
+						return
+					}
+					delete(calls, event.Index)
 				}
 				continue
 			}
@@ -188,12 +213,24 @@ func (m *agenticModel) request(input []*schema.AgenticMessage, stream bool, opts
 			}
 			switch b.Type {
 			case schema.ContentBlockTypeUserInputText:
+				if b.UserInputText == nil {
+					return nil, invalidClaudeBlock()
+				}
 				content = append(content, map[string]any{"type": "text", "text": b.UserInputText.Text})
 			case schema.ContentBlockTypeAssistantGenText:
+				if b.AssistantGenText == nil {
+					return nil, invalidClaudeBlock()
+				}
 				content = append(content, map[string]any{"type": "text", "text": b.AssistantGenText.Text})
 			case schema.ContentBlockTypeReasoning:
+				if b.Reasoning == nil {
+					return nil, invalidClaudeBlock()
+				}
 				content = append(content, map[string]any{"type": "thinking", "thinking": b.Reasoning.Text, "signature": b.Reasoning.Signature})
 			case schema.ContentBlockTypeFunctionToolCall:
+				if b.FunctionToolCall == nil {
+					return nil, invalidClaudeBlock()
+				}
 				var args any
 				if json.Unmarshal([]byte(b.FunctionToolCall.Arguments), &args) != nil {
 					return nil, &einoproviders.UnsupportedCapabilityError{Provider: "claude", Protocol: "messages", Capability: "function_arguments"}
@@ -236,6 +273,10 @@ func (m *agenticModel) request(input []*schema.AgenticMessage, stream bool, opts
 	return json.Marshal(payload)
 }
 
+func invalidClaudeBlock() error {
+	return &einoproviders.UnsupportedCapabilityError{Provider: "claude", Protocol: "messages", Capability: "malformed_block"}
+}
+
 type claudeResponse struct {
 	ID         string          `json:"id"`
 	Model      string          `json:"model"`
@@ -264,9 +305,19 @@ type claudeStreamEvent struct {
 		Thinking    string `json:"thinking"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
+	ContentBlock struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block"`
 	Message struct {
 		Model string `json:"model"`
 	} `json:"message"`
+}
+
+type claudePendingToolCall struct {
+	id, name  string
+	arguments strings.Builder
 }
 
 func (m *agenticModel) fromResponse(wire claudeResponse, streaming bool) *schema.AgenticMessage {

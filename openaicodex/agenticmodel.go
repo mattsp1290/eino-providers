@@ -173,12 +173,24 @@ func agenticMessagesToInput(messages []*schema.AgenticMessage) (string, []any, e
 			}
 			switch b.Type {
 			case schema.ContentBlockTypeUserInputText:
+				if b.UserInputText == nil {
+					return "", nil, invalidCodexBlock()
+				}
 				text += b.UserInputText.Text
 			case schema.ContentBlockTypeAssistantGenText:
+				if b.AssistantGenText == nil {
+					return "", nil, invalidCodexBlock()
+				}
 				text += b.AssistantGenText.Text
 			case schema.ContentBlockTypeReasoning:
+				if b.Reasoning == nil {
+					return "", nil, invalidCodexBlock()
+				}
 				items = append(items, map[string]any{"type": "reasoning", "encrypted_content": b.Reasoning.Signature, "summary": []map[string]any{{"type": "summary_text", "text": b.Reasoning.Text}}})
 			case schema.ContentBlockTypeFunctionToolCall:
+				if b.FunctionToolCall == nil {
+					return "", nil, invalidCodexBlock()
+				}
 				items = append(items, inputFunctionCall{Type: "function_call", Name: b.FunctionToolCall.Name, Arguments: b.FunctionToolCall.Arguments, CallID: b.FunctionToolCall.CallID})
 			case schema.ContentBlockTypeFunctionToolResult:
 				if b.FunctionToolResult == nil || len(b.FunctionToolResult.Content) != 1 || b.FunctionToolResult.Content[0].Text == nil {
@@ -205,4 +217,8 @@ func agenticMessagesToInput(messages []*schema.AgenticMessage) (string, []any, e
 		}
 	}
 	return strings.Join(system, "\n\n"), items, nil
+}
+
+func invalidCodexBlock() error {
+	return &einoproviders.UnsupportedCapabilityError{Provider: "openai-codex", Protocol: "responses", Capability: "malformed_block"}
 }
