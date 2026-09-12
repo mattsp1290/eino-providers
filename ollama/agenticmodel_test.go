@@ -81,7 +81,7 @@ func TestAgenticModelGenerateAndStreamUseNativeChatProtocol(t *testing.T) {
 		}
 		chunks = append(chunks, chunk)
 	}
-	if len(chunks) != 2 || chunks[0].ContentBlocks[0].AssistantGenText.Text != "hi" || chunks[1].ContentBlocks[0].StreamingMeta.Index != 0 {
+	if len(chunks) != 2 || chunks[0].ContentBlocks[0].AssistantGenText.Text != "hi" || chunks[1].ContentBlocks[0].StreamingMeta.Index != 1 {
 		t.Fatalf("stream chunks = %#v", chunks)
 	}
 	concatenated, err := schema.ConcatAgenticMessages(chunks)
@@ -130,6 +130,21 @@ func TestAgenticModelAssignsSyntheticToolCallIDs(t *testing.T) {
 	}{Name: "weather", Arguments: map[string]any{"city": "NYC"}}}}}}, false)
 	if got := message.ContentBlocks[0].FunctionToolCall.CallID; got != "ollama-0" {
 		t.Fatalf("CallID=%q", got)
+	}
+}
+
+func TestAgenticModelStreamUsesDistinctThinkingAndTextIndexes(t *testing.T) {
+	m := &agenticModel{model: "m"}
+	chunks := []*schema.AgenticMessage{
+		m.fromResponse(ollamaChatResponse{Message: ollamaMessage{Thinking: "reason"}}, true),
+		m.fromResponse(ollamaChatResponse{Message: ollamaMessage{Content: "answer"}}, true),
+	}
+	combined, err := schema.ConcatAgenticMessages(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined.ContentBlocks) != 2 || combined.ContentBlocks[0].Reasoning == nil || combined.ContentBlocks[1].AssistantGenText == nil {
+		t.Fatalf("combined = %#v", combined)
 	}
 }
 

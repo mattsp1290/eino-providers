@@ -339,24 +339,24 @@ func toOllamaAgenticTools(tools []*schema.ToolInfo) ([]ollamaTool, error) {
 func (m *agenticModel) fromResponse(wire ollamaChatResponse, streaming bool) *schema.AgenticMessage {
 	blocks := make([]*schema.ContentBlock, 0, 2+len(wire.Message.ToolCalls))
 	index := 0
-	add := func(block *schema.ContentBlock) {
+	add := func(block *schema.ContentBlock, streamIndex int) {
 		if streaming {
-			block.StreamingMeta = &schema.StreamingMeta{Index: index}
+			block.StreamingMeta = &schema.StreamingMeta{Index: streamIndex}
 		}
 		index++
 		blocks = append(blocks, block)
 	}
 	if wire.Message.Thinking != "" {
-		add(schema.NewContentBlock(&schema.Reasoning{Text: wire.Message.Thinking}))
+		add(schema.NewContentBlock(&schema.Reasoning{Text: wire.Message.Thinking}), 0)
 	}
 	if wire.Message.Content != "" {
-		add(schema.NewContentBlock(&schema.AssistantGenText{Text: wire.Message.Content}))
+		add(schema.NewContentBlock(&schema.AssistantGenText{Text: wire.Message.Content}), 1)
 	}
 	for callIndex, call := range wire.Message.ToolCalls {
 		args, _ := json.Marshal(call.Function.Arguments)
 		// Ollama does not expose a wire call ID. This is deliberately a
 		// request-local synthetic correlation ID and is never serialized back.
-		add(schema.NewContentBlock(&schema.FunctionToolCall{CallID: fmt.Sprintf("ollama-%d", callIndex), Name: call.Function.Name, Arguments: string(args)}))
+		add(schema.NewContentBlock(&schema.FunctionToolCall{CallID: fmt.Sprintf("ollama-%d", callIndex), Name: call.Function.Name, Arguments: string(args)}), 2+callIndex)
 	}
 	message := &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant, ContentBlocks: blocks}
 	if !streaming || wire.Done {
