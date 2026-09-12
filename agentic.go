@@ -45,7 +45,7 @@ type identifiedAgenticModel struct {
 func (m *identifiedAgenticModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
 	message, err := m.delegate.Generate(ctx, input, opts...)
 	if err == nil {
-		m.attach(message)
+		m.attach(message, m.effectiveIdentity(opts...))
 	}
 	return message, err
 }
@@ -55,13 +55,23 @@ func (m *identifiedAgenticModel) Stream(ctx context.Context, input []*schema.Age
 	if err != nil {
 		return nil, err
 	}
+	identity := m.effectiveIdentity(opts...)
 	return schema.StreamReaderWithConvert(stream, func(message *schema.AgenticMessage) (*schema.AgenticMessage, error) {
-		m.attach(message)
+		m.attach(message, identity)
 		return message, nil
 	}), nil
 }
 
-func (m *identifiedAgenticModel) attach(message *schema.AgenticMessage) {
+func (m *identifiedAgenticModel) effectiveIdentity(opts ...model.Option) AgenticResponseIdentity {
+	identity := m.identity
+	common := model.GetCommonOptions(&model.Options{}, opts...)
+	if common.Model != nil {
+		identity.RequestedModel = *common.Model
+	}
+	return identity
+}
+
+func (m *identifiedAgenticModel) attach(message *schema.AgenticMessage, identity AgenticResponseIdentity) {
 	if message == nil {
 		return
 	}
@@ -69,7 +79,7 @@ func (m *identifiedAgenticModel) attach(message *schema.AgenticMessage) {
 		message.ResponseMeta = &schema.AgenticResponseMeta{}
 	}
 	native := message.ResponseMeta.Extension
-	message.ResponseMeta.Extension = AgenticResponseMetadata{Identity: m.identity, Native: native}
+	message.ResponseMeta.Extension = AgenticResponseMetadata{Identity: identity, Native: native}
 }
 
 // AgenticContinuationState is an opaque, versioned provider payload returned
