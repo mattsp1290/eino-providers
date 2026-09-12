@@ -55,7 +55,7 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("gemini: bound agentic model: %w", err))
 	}
-	return &geminiAgenticModel{delegate: bounded}, nil
+	return &geminiAgenticModel{delegate: einoproviders.NewIdentifiedAgenticModel(bounded, einoproviders.AgenticResponseIdentity{Provider: "gemini", Protocol: "generateContent", RequestedModel: cfg.Model})}, nil
 }
 
 type geminiAgenticModel struct{ delegate model.AgenticModel }

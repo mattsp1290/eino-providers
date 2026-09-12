@@ -31,6 +31,47 @@ type AgenticResponseMetadata struct {
 	Native   any                     `json:"native,omitempty"`
 }
 
+// NewIdentifiedAgenticModel preserves a delegate's native extension while
+// attaching the stable identity contract required by this module.
+func NewIdentifiedAgenticModel(delegate model.AgenticModel, identity AgenticResponseIdentity) model.AgenticModel {
+	return &identifiedAgenticModel{delegate: delegate, identity: identity}
+}
+
+type identifiedAgenticModel struct {
+	delegate model.AgenticModel
+	identity AgenticResponseIdentity
+}
+
+func (m *identifiedAgenticModel) Generate(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.AgenticMessage, error) {
+	message, err := m.delegate.Generate(ctx, input, opts...)
+	if err == nil {
+		m.attach(message)
+	}
+	return message, err
+}
+
+func (m *identifiedAgenticModel) Stream(ctx context.Context, input []*schema.AgenticMessage, opts ...model.Option) (*schema.StreamReader[*schema.AgenticMessage], error) {
+	stream, err := m.delegate.Stream(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderWithConvert(stream, func(message *schema.AgenticMessage) (*schema.AgenticMessage, error) {
+		m.attach(message)
+		return message, nil
+	}), nil
+}
+
+func (m *identifiedAgenticModel) attach(message *schema.AgenticMessage) {
+	if message == nil {
+		return
+	}
+	if message.ResponseMeta == nil {
+		message.ResponseMeta = &schema.AgenticResponseMeta{}
+	}
+	native := message.ResponseMeta.Extension
+	message.ResponseMeta.Extension = AgenticResponseMetadata{Identity: m.identity, Native: native}
+}
+
 // AgenticContinuationState is an opaque, versioned provider payload returned
 // by a provider's SplitAgenticContinuation helper. Applications may persist it
 // alongside the sanitized public message, but must not inspect or display it.

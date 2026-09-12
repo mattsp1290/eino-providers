@@ -61,5 +61,9 @@ func NewAgenticModel(ctx context.Context, cfg AgenticModelConfig) (model.Agentic
 	if err != nil {
 		return nil, einoproviders.WrapInitError(fmt.Errorf("openai: build agentic responses model %q: %w", cfg.Model, err))
 	}
-	return einoproviders.NewBoundedAgenticModel(m, limits)
+	bounded, err := einoproviders.NewBoundedAgenticModel(m, limits)
+	if err != nil {
+		return nil, err
+	}
+	return einoproviders.NewIdentifiedAgenticModel(bounded, einoproviders.AgenticResponseIdentity{Provider: "openai", Protocol: "responses", RequestedModel: cfg.Model}), nil
 }
