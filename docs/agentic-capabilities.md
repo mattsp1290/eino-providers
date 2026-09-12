@@ -28,6 +28,15 @@ fixture tests are the source of truth for each implemented request/response
 codec; credentialed live verification remains opt-in and is never used as
 ordinary CI evidence.
 
+## Continuation persistence boundary
+
+Continuation helpers preserve JSON-safe extras and reasoning signatures through
+a sanitized public projection and opaque state. They do not promise lossless
+round-tripping of adapter-private Go runtime values stored in `any` extensions
+after a type-erasing JSON persistence cycle. Consumers requiring such private
+replay values must keep the provider-native continuation in-process; this
+library will not fabricate or reinterpret private runtime types.
+
 ## Stream lifecycle boundary
 
 `schema.StreamReader.Close` in the pinned Eino v0.9.19 API closes only its
